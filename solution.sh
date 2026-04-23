@@ -83,8 +83,7 @@ publish_failure() {
   exit 1
 }
 
-# 0) Wait for Valkey to accept commands (PING). Handles the case where
-#    the StatefulSet was just scaled back up and the pod is still warming.
+echo "[backup] step: PING wait"
 i=0
 while [ $i -lt 30 ]; do
   if valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning PING 2>/dev/null \
@@ -94,20 +93,22 @@ while [ $i -lt 30 ]; do
   sleep 2
   i=$((i+1))
 done
+echo "[backup] step: PING ready after ${i} attempts"
 
-# 1) Force a fresh snapshot and wait for LASTSAVE to advance.
-#    BGSAVE can return "Background save already in progress" if a previous
-#    save is still running; treat that as OK, we still want LASTSAVE to
-#    advance before proceeding.
+echo "[backup] step: reading PREV_LASTSAVE"
 PREV_LASTSAVE=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning LASTSAVE 2>/dev/null | tr -d '[:space:]')
 [ -z "${PREV_LASTSAVE}" ] && PREV_LASTSAVE=0
+echo "[backup] step: PREV_LASTSAVE=${PREV_LASTSAVE}"
 
+echo "[backup] step: BGSAVE"
 BGSAVE_OUT=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning BGSAVE 2>&1)
 BGSAVE_RC=$?
+echo "[backup] step: BGSAVE rc=${BGSAVE_RC} out=${BGSAVE_OUT}"
 if [ "${BGSAVE_RC}" != "0" ] && ! printf '%s' "${BGSAVE_OUT}" | grep -qi "in progress"; then
   publish_failure "BGSAVE failed (rc=${BGSAVE_RC}): ${BGSAVE_OUT}"
 fi
 
+echo "[backup] step: waiting for LASTSAVE advance"
 NEW_LASTSAVE=${PREV_LASTSAVE}
 i=0
 while [ $i -lt 45 ]; do
@@ -119,6 +120,7 @@ while [ $i -lt 45 ]; do
   sleep 1
   i=$((i+1))
 done
+echo "[backup] step: LASTSAVE advanced: ${PREV_LASTSAVE} -> ${NEW_LASTSAVE} (after ${i}s)"
 if [ "${NEW_LASTSAVE}" = "${PREV_LASTSAVE}" ]; then
   publish_failure "LASTSAVE did not advance after BGSAVE within 45s (prev=${PREV_LASTSAVE})"
 fi
