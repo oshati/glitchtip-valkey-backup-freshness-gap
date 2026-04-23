@@ -168,6 +168,9 @@ echo "[backup] step: body file=${ART_BODY_FILE} size=${BODY_SIZE}"
 echo "[backup] step: POST artifact CM ${ARTIFACT_CM}"
 ART_RESPONSE_FILE=/tmp/art-response-${TS}.txt
 WGET_ERR_FILE=/tmp/art-err-${TS}.txt
+# IMPORTANT: trap wget's rc manually — with `set -e` a non-zero wget exit
+# would abort the script before we got to log anything useful.
+WGET_RC=0
 wget -S -O "${ART_RESPONSE_FILE}" \
   --header="Authorization: Bearer ${TOKEN}" \
   --ca-certificate="${CA}" \
@@ -175,8 +178,7 @@ wget -S -O "${ART_RESPONSE_FILE}" \
   --header="Content-Type: application/json" \
   --body-file="${ART_BODY_FILE}" \
   "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" \
-  2>"${WGET_ERR_FILE}"
-WGET_RC=$?
+  2>"${WGET_ERR_FILE}" || WGET_RC=$?
 echo "[backup] step: POST rc=${WGET_RC}"
 echo "[backup] step: POST stderr head: $(head -c 400 "${WGET_ERR_FILE}" 2>/dev/null)"
 echo "[backup] step: POST response head: $(head -c 400 "${ART_RESPONSE_FILE}" 2>/dev/null)"
