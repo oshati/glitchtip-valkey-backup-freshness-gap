@@ -34,6 +34,8 @@ echo "[backup] PATH=${PATH}  VALKEY_HOST=${VALKEY_HOST}"
 which valkey-cli || true
 which curl || true
 ls -la /tools/ 2>/dev/null || true
+echo "[backup] curl version:"
+curl --version 2>&1 | head -2 || echo "[backup] curl failed to run"
 
 TS=$(date +%Y%m%d_%H%M%S)
 BACKUP_ID="valkey-${TS}"
@@ -168,7 +170,9 @@ echo "[backup] step: body file=${ART_BODY_FILE} size=${BODY_SIZE}"
 
 echo "[backup] step: POST artifact CM ${ARTIFACT_CM}"
 ART_RESPONSE_FILE=/tmp/art-response-${TS}.txt
+ART_ERR_FILE=/tmp/art-err-${TS}.txt
 HTTP_CODE=0
+CURL_RC=0
 HTTP_CODE=$(curl -sS --cacert "${CA}" \
   -X POST \
   -H "Authorization: Bearer ${TOKEN}" \
@@ -176,13 +180,14 @@ HTTP_CODE=$(curl -sS --cacert "${CA}" \
   --data-binary "@${ART_BODY_FILE}" \
   -o "${ART_RESPONSE_FILE}" \
   -w '%{http_code}' \
-  "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" 2>&1) \
-  || HTTP_CODE=curl-error
-echo "[backup] step: POST http_code=${HTTP_CODE}"
+  "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" \
+  2>"${ART_ERR_FILE}") || CURL_RC=$?
+echo "[backup] step: POST curl_rc=${CURL_RC} http_code=${HTTP_CODE}"
+echo "[backup] step: POST stderr: $(head -c 400 "${ART_ERR_FILE}" 2>/dev/null)"
 echo "[backup] step: POST response head: $(head -c 300 "${ART_RESPONSE_FILE}" 2>/dev/null)"
-if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then
-  SNIPPET=$(head -c 500 "${ART_RESPONSE_FILE}" 2>/dev/null)
-  publish_failure "artifact POST failed (http=${HTTP_CODE}): ${SNIPPET}"
+if [ "${CURL_RC}" != "0" ] || { [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; }; then
+  SNIPPET="curl_rc=${CURL_RC} http=${HTTP_CODE} stderr=$(head -c 300 "${ART_ERR_FILE}" 2>/dev/null) body=$(head -c 200 "${ART_RESPONSE_FILE}" 2>/dev/null)"
+  publish_failure "artifact POST failed: ${SNIPPET}"
 fi
 echo "[backup] step: artifact persisted"
 
