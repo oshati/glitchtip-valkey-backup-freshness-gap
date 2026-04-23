@@ -1,0 +1,44 @@
+id: glitchtip-valkey-backup-freshness-gap
+prompt: |
+  [Context]
+  The platform team reran the GlitchTip recovery drill after a rough week of
+  incident noise, and the uncomfortable finding this time was not the database
+  dump or the attachment archive. Those existed.
+
+  The bad surprise was that the restored runtime state backed by Valkey was
+  clearly older than the point when the backup job claimed success. Recent mute
+  state, throttling data, and other short-horizon coordination state that
+  operators expected to survive the drill did not line up with the moment the
+  backup was supposedly taken.
+
+  This means the current pipeline is giving people the wrong kind of confidence:
+  it can produce a green-looking run record even when the Valkey portion is
+  stale, not freshly snapshotted, or not realistically reusable for recovery.
+
+  [TASK]
+  Investigate the existing backup flow in the `glitchtip` namespace and make
+  the Valkey portion trustworthy again.
+
+  A healthy run should only report success after it has actually captured a
+  fresh Valkey backup artifact and left that artifact somewhere durable in the
+  cluster. A bad run should stop itself instead of quietly publishing a green
+  record based on stale state or pod-local scratch output.
+
+  There is already a human-readable run note and a machine-readable restore
+  handoff somewhere in the cluster, but on-call cannot trust either one right
+  now. Refresh both of them from the latest run without requiring someone to
+  open pod logs. Failed runs should clearly mark restore as unsafe. Successful
+  runs should include concrete details showing that a real backup artifact was
+  produced and that it is current enough to use for recovery.
+
+  Do not solve this by hand-editing live Valkey data, disabling the guardrails,
+  or broadening access just to force a green result. The point is to make the
+  pipeline tell the truth about what it captured and preserve a backup that
+  downstream recovery tooling can actually use.
+
+  A few earlier fixes looked fine for one run and then quietly drifted back
+  after the surrounding backup automation reconciled itself, so make sure the
+  repair survives the current job-management flow instead of only working once.
+metadata:
+  category: platform-eng
+  difficulty: hard
