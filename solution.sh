@@ -78,15 +78,34 @@ publish_failure() {
   exit 1
 }
 
+# 0) Wait for Valkey to accept commands (PING). Handles the case where
+#    the StatefulSet was just scaled back up and the pod is still warming.
+i=0
+while [ $i -lt 30 ]; do
+  if valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning PING 2>/dev/null \
+       | grep -q PONG; then
+    break
+  fi
+  sleep 2
+  i=$((i+1))
+done
+
 # 1) Force a fresh snapshot and wait for LASTSAVE to advance.
+#    BGSAVE can return "Background save already in progress" if a previous
+#    save is still running; treat that as OK, we still want LASTSAVE to
+#    advance before proceeding.
 PREV_LASTSAVE=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning LASTSAVE 2>/dev/null | tr -d '[:space:]')
 [ -z "${PREV_LASTSAVE}" ] && PREV_LASTSAVE=0
-valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning BGSAVE 2>/dev/null || \
-  publish_failure "BGSAVE failed (Valkey unreachable or save-in-progress)"
+
+BGSAVE_OUT=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning BGSAVE 2>&1)
+BGSAVE_RC=$?
+if [ "${BGSAVE_RC}" != "0" ] && ! printf '%s' "${BGSAVE_OUT}" | grep -qi "in progress"; then
+  publish_failure "BGSAVE failed (rc=${BGSAVE_RC}): ${BGSAVE_OUT}"
+fi
 
 NEW_LASTSAVE=${PREV_LASTSAVE}
 i=0
-while [ $i -lt 30 ]; do
+while [ $i -lt 45 ]; do
   CURR=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning LASTSAVE 2>/dev/null | tr -d '[:space:]')
   if [ -n "${CURR}" ] && [ "${CURR}" -gt "${PREV_LASTSAVE}" ] 2>/dev/null; then
     NEW_LASTSAVE=${CURR}
@@ -96,7 +115,7 @@ while [ $i -lt 30 ]; do
   i=$((i+1))
 done
 if [ "${NEW_LASTSAVE}" = "${PREV_LASTSAVE}" ]; then
-  publish_failure "LASTSAVE did not advance after BGSAVE (${PREV_LASTSAVE})"
+  publish_failure "LASTSAVE did not advance after BGSAVE within 45s (prev=${PREV_LASTSAVE})"
 fi
 
 # 2) Stream the fresh snapshot to a file.
@@ -120,17 +139,29 @@ if [ -z "${DBSIZE}" ] || [ "${DBSIZE}" = "0" ] 2>/dev/null; then
 fi
 
 # 5) Persist the artifact as a binaryData ConfigMap.
+#    Build the body in a file so we don't hit argv length / shell quoting
+#    limits, and capture wget's response so any API error is visible in the
+#    failure message.
 ARTIFACT_CM="valkey-backup-${TS}"
 RDB_B64=$(base64 -w 0 "${OUT}" 2>/dev/null || base64 "${OUT}" | tr -d '\n')
-ART_BODY="{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"${ARTIFACT_CM}\",\"namespace\":\"${NS}\",\"labels\":{\"app\":\"glitchtip\",\"component\":\"valkey-backup-artifact\",\"backup-id\":\"${BACKUP_ID}\"}},\"binaryData\":{\"dump.rdb\":\"${RDB_B64}\"}}"
-wget -qO- \
+ART_BODY_FILE=/tmp/art-body-${TS}.json
+printf '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"%s","namespace":"%s","labels":{"app":"glitchtip","component":"valkey-backup-artifact","backup-id":"%s"}},"binaryData":{"dump.rdb":"%s"}}' \
+  "${ARTIFACT_CM}" "${NS}" "${BACKUP_ID}" "${RDB_B64}" > "${ART_BODY_FILE}"
+ART_RESPONSE_FILE=/tmp/art-response-${TS}.txt
+WGET_ERR_FILE=/tmp/art-err-${TS}.txt
+wget -S -O "${ART_RESPONSE_FILE}" \
   --header="Authorization: Bearer ${TOKEN}" \
   --ca-certificate="${CA}" \
   --method=POST \
   --header="Content-Type: application/json" \
-  --body-data="${ART_BODY}" \
+  --body-file="${ART_BODY_FILE}" \
   "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" \
-  >/dev/null 2>&1 || publish_failure "failed to persist artifact to ConfigMap ${ARTIFACT_CM}"
+  2>"${WGET_ERR_FILE}"
+WGET_RC=$?
+if [ "${WGET_RC}" != "0" ]; then
+  SNIPPET=$(head -c 600 "${WGET_ERR_FILE}" 2>/dev/null; echo; head -c 400 "${ART_RESPONSE_FILE}" 2>/dev/null)
+  publish_failure "artifact POST failed (rc=${WGET_RC}): ${SNIPPET}"
+fi
 
 # 6) Publish truthful status + handoff.
 STATUS_MD="# Valkey backup run ${BACKUP_ID}
