@@ -164,6 +164,18 @@ def trigger_backup(job_name, wait_seconds=300):
         "--all-containers --tail=300 2>/dev/null",
         timeout=30,
     )
+    if not logs.strip():
+        _, pods, _ = run_cmd(
+            f"kubectl get pods -n {NAMESPACE} -l job-name={job_name} "
+            "-o wide 2>&1",
+            timeout=20,
+        )
+        _, ev, _ = run_cmd(
+            f"kubectl get events -n {NAMESPACE} "
+            "--sort-by='.lastTimestamp' 2>&1 | tail -15",
+            timeout=20,
+        )
+        logs = f"[no container logs]\npods:\n{pods}\n---\nrecent events:\n{ev}"
     return completed, logs, ""
 
 
