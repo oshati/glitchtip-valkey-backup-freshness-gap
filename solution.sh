@@ -146,21 +146,26 @@ if [ "${SIZE}" -lt 200 ] 2>/dev/null; then
   publish_failure "RDB too small (${SIZE} bytes)"
 fi
 
-# 4) Restore proof — capture live DBSIZE at snapshot time.
+echo "[backup] step: reading DBSIZE"
 DBSIZE=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning DBSIZE 2>/dev/null | tr -d '[:space:]')
+echo "[backup] step: DBSIZE=${DBSIZE}"
 if [ -z "${DBSIZE}" ] || [ "${DBSIZE}" = "0" ] 2>/dev/null; then
   publish_failure "Valkey DBSIZE is 0 — nothing to back up"
 fi
 
-# 5) Persist the artifact as a binaryData ConfigMap.
-#    Build the body in a file so we don't hit argv length / shell quoting
-#    limits, and capture wget's response so any API error is visible in the
-#    failure message.
+echo "[backup] step: base64-encoding RDB"
 ARTIFACT_CM="valkey-backup-${TS}"
 RDB_B64=$(base64 -w 0 "${OUT}" 2>/dev/null || base64 "${OUT}" | tr -d '\n')
+echo "[backup] step: base64 size=${#RDB_B64}"
+
+echo "[backup] step: building body file"
 ART_BODY_FILE=/tmp/art-body-${TS}.json
 printf '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"%s","namespace":"%s","labels":{"app":"glitchtip","component":"valkey-backup-artifact","backup-id":"%s"}},"binaryData":{"dump.rdb":"%s"}}' \
   "${ARTIFACT_CM}" "${NS}" "${BACKUP_ID}" "${RDB_B64}" > "${ART_BODY_FILE}"
+BODY_SIZE=$(wc -c < "${ART_BODY_FILE}")
+echo "[backup] step: body file=${ART_BODY_FILE} size=${BODY_SIZE}"
+
+echo "[backup] step: POST artifact CM ${ARTIFACT_CM}"
 ART_RESPONSE_FILE=/tmp/art-response-${TS}.txt
 WGET_ERR_FILE=/tmp/art-err-${TS}.txt
 wget -S -O "${ART_RESPONSE_FILE}" \
@@ -172,10 +177,14 @@ wget -S -O "${ART_RESPONSE_FILE}" \
   "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" \
   2>"${WGET_ERR_FILE}"
 WGET_RC=$?
+echo "[backup] step: POST rc=${WGET_RC}"
+echo "[backup] step: POST stderr head: $(head -c 400 "${WGET_ERR_FILE}" 2>/dev/null)"
+echo "[backup] step: POST response head: $(head -c 400 "${ART_RESPONSE_FILE}" 2>/dev/null)"
 if [ "${WGET_RC}" != "0" ]; then
-  SNIPPET=$(head -c 600 "${WGET_ERR_FILE}" 2>/dev/null; echo; head -c 400 "${ART_RESPONSE_FILE}" 2>/dev/null)
+  SNIPPET=$(head -c 500 "${WGET_ERR_FILE}" 2>/dev/null; echo; head -c 300 "${ART_RESPONSE_FILE}" 2>/dev/null)
   publish_failure "artifact POST failed (rc=${WGET_RC}): ${SNIPPET}"
 fi
+echo "[backup] step: artifact persisted"
 
 # 6) Publish truthful status + handoff.
 STATUS_MD="# Valkey backup run ${BACKUP_ID}
