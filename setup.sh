@@ -361,6 +361,17 @@ spec:
             volumeMounts:
             - name: tools
               mountPath: /tools
+          - name: ship-curl
+            image: docker.io/curlimages/curl:8.9.1
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              cp /usr/bin/curl /tools/curl
+              chmod +x /tools/curl
+            volumeMounts:
+            - name: tools
+              mountPath: /tools
           containers:
           - name: backup
             image: docker.io/valkey/valkey:7.2-alpine

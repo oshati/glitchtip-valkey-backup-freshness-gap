@@ -27,10 +27,12 @@ cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 #  - refreshes status.md and handoff.json with real metadata,
 #  - fails closed and marks safe_for_restore=false with a reason.
 exec 2>&1
+export PATH="/tools:${PATH}"
 set -e
 echo "[backup] pod started at $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname)"
 echo "[backup] PATH=${PATH}  VALKEY_HOST=${VALKEY_HOST}"
 which valkey-cli || true
+which curl || true
 ls -la /tools/ 2>/dev/null || true
 
 TS=$(date +%Y%m%d_%H%M%S)
@@ -52,12 +54,11 @@ json_str() {
 patch_cm() {
   cm="$1"; key="$2"; val="$3"
   body="{\"data\":{\"${key}\":${val}}}"
-  wget -qO- \
-    --header="Authorization: Bearer ${TOKEN}" \
-    --ca-certificate="${CA}" \
-    --method=PATCH \
-    --header="Content-Type: application/merge-patch+json" \
-    --body-data="${body}" \
+  curl -sS --fail --cacert "${CA}" \
+    -X PATCH \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/merge-patch+json" \
+    -d "${body}" \
     "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}" \
     >/dev/null 2>&1 || return 1
 }
@@ -167,24 +168,21 @@ echo "[backup] step: body file=${ART_BODY_FILE} size=${BODY_SIZE}"
 
 echo "[backup] step: POST artifact CM ${ARTIFACT_CM}"
 ART_RESPONSE_FILE=/tmp/art-response-${TS}.txt
-WGET_ERR_FILE=/tmp/art-err-${TS}.txt
-# IMPORTANT: trap wget's rc manually — with `set -e` a non-zero wget exit
-# would abort the script before we got to log anything useful.
-WGET_RC=0
-wget -S -O "${ART_RESPONSE_FILE}" \
-  --header="Authorization: Bearer ${TOKEN}" \
-  --ca-certificate="${CA}" \
-  --method=POST \
-  --header="Content-Type: application/json" \
-  --body-file="${ART_BODY_FILE}" \
-  "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" \
-  2>"${WGET_ERR_FILE}" || WGET_RC=$?
-echo "[backup] step: POST rc=${WGET_RC}"
-echo "[backup] step: POST stderr head: $(head -c 400 "${WGET_ERR_FILE}" 2>/dev/null)"
-echo "[backup] step: POST response head: $(head -c 400 "${ART_RESPONSE_FILE}" 2>/dev/null)"
-if [ "${WGET_RC}" != "0" ]; then
-  SNIPPET=$(head -c 500 "${WGET_ERR_FILE}" 2>/dev/null; echo; head -c 300 "${ART_RESPONSE_FILE}" 2>/dev/null)
-  publish_failure "artifact POST failed (rc=${WGET_RC}): ${SNIPPET}"
+HTTP_CODE=0
+HTTP_CODE=$(curl -sS --cacert "${CA}" \
+  -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data-binary "@${ART_BODY_FILE}" \
+  -o "${ART_RESPONSE_FILE}" \
+  -w '%{http_code}' \
+  "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps" 2>&1) \
+  || HTTP_CODE=curl-error
+echo "[backup] step: POST http_code=${HTTP_CODE}"
+echo "[backup] step: POST response head: $(head -c 300 "${ART_RESPONSE_FILE}" 2>/dev/null)"
+if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then
+  SNIPPET=$(head -c 500 "${ART_RESPONSE_FILE}" 2>/dev/null)
+  publish_failure "artifact POST failed (http=${HTTP_CODE}): ${SNIPPET}"
 fi
 echo "[backup] step: artifact persisted"
 
