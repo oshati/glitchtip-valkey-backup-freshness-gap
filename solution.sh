@@ -125,16 +125,23 @@ if [ "${NEW_LASTSAVE}" = "${PREV_LASTSAVE}" ]; then
   publish_failure "LASTSAVE did not advance after BGSAVE within 45s (prev=${PREV_LASTSAVE})"
 fi
 
-# 2) Stream the fresh snapshot to a file.
-valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning --rdb "${OUT}" 2>/dev/null || \
-  publish_failure "valkey-cli --rdb failed to stream the snapshot"
+echo "[backup] step: fetching RDB via --rdb into ${OUT}"
+RDB_LOG=/tmp/rdb.log
+valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning --rdb "${OUT}" >"${RDB_LOG}" 2>&1
+RDB_RC=$?
+echo "[backup] step: --rdb rc=${RDB_RC} log='$(head -c 200 "${RDB_LOG}" 2>/dev/null)'"
+if [ "${RDB_RC}" != "0" ]; then
+  publish_failure "valkey-cli --rdb failed (rc=${RDB_RC}): $(head -c 200 "${RDB_LOG}" 2>/dev/null)"
+fi
+if [ ! -f "${OUT}" ]; then
+  publish_failure "RDB file was not written"
+fi
 
-[ -f "${OUT}" ] || publish_failure "RDB file was not written"
-
-# 3) Validate magic bytes + size.
+echo "[backup] step: validate magic + size"
 MAGIC=$(head -c 5 "${OUT}" 2>/dev/null || true)
-[ "${MAGIC}" = "REDIS" ] || publish_failure "RDB does not start with REDIS magic bytes"
 SIZE=$(wc -c < "${OUT}" | tr -d '[:space:]')
+echo "[backup] step: magic='${MAGIC}' size=${SIZE}"
+[ "${MAGIC}" = "REDIS" ] || publish_failure "RDB does not start with REDIS magic bytes"
 if [ "${SIZE}" -lt 200 ] 2>/dev/null; then
   publish_failure "RDB too small (${SIZE} bytes)"
 fi
