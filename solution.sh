@@ -27,12 +27,10 @@ cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 #  - refreshes status.md and handoff.json with real metadata,
 #  - fails closed and marks safe_for_restore=false with a reason.
 exec 2>&1
-set -x
 set -e
-echo "[backup] pod started running backup.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ) on host=$(hostname) as user=$(id -un)"
-echo "[backup] PATH=${PATH}"
-echo "[backup] VALKEY_HOST=${VALKEY_HOST}"
-which valkey-cli || echo "[backup] WARN: valkey-cli not in PATH yet"
+echo "[backup] pod started at $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname)"
+echo "[backup] PATH=${PATH}  VALKEY_HOST=${VALKEY_HOST}"
+which valkey-cli || true
 ls -la /tools/ 2>/dev/null || true
 
 TS=$(date +%Y%m%d_%H%M%S)
