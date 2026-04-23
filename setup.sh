@@ -220,8 +220,11 @@ for _ in $(seq 1 30); do
   if [ -n "${LAST}" ] && [ "${LAST}" != "0" ]; then break; fi
   sleep 1
 done
-# Backdate the RDB mtime to 7 days ago
-kubectl exec -n glitchtip "${VALKEY_POD}" -- sh -c "touch -d '7 days ago' /data/dump.rdb"
+# Backdate the RDB mtime to 7 days ago.
+# Compute the stamp in the setup container (GNU date) and apply it
+# inside the alpine Valkey pod using busybox `touch -t` (no GNU -d).
+STALE_STAMP=$(date -u -d "@$(( $(date -u +%s) - 7*24*3600 ))" '+%Y%m%d%H%M.%S')
+kubectl exec -n glitchtip "${VALKEY_POD}" -- touch -t "${STALE_STAMP}" /data/dump.rdb
 STALE_MTIME=$(kubectl exec -n glitchtip "${VALKEY_POD}" -- stat -c '%Y' /data/dump.rdb)
 echo "[setup] On-disk dump.rdb backdated to epoch ${STALE_MTIME} (stale by design)."
 
