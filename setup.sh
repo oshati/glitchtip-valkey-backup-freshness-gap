@@ -353,6 +353,7 @@ metadata:
     component: valkey-backup
   annotations:
     description: "Backs up GlitchTip's Valkey runtime state. Runs hourly."
+    owner-note: "Currently runs as the glitchtip namespace 'default' SA — replace with a dedicated, narrowly-scoped SA (patch/update only on glitchtip-valkey-backup-status + glitchtip-valkey-backup-restore-handoff, plus create on configmaps for the artifact). Do NOT reuse backup-drift-reconciler-sa."
 spec:
   schedule: "17 * * * *"
   concurrencyPolicy: Forbid
@@ -451,19 +452,31 @@ data:
 
     - Status: SUCCESS
     - Backup ID: valkey-20260330_021711
+    - Snapshot captured at: 2026-03-30T02:17:11Z (epoch=1711761431)
     - Artifact bytes: 214562
-    - Snapshot verified: (not recorded)
-    - Restore proof: (not recorded)
+    - Restore proof: (not recorded — needs key_count_at_snapshot from a fresh DBSIZE read)
+
+    ### Required run-detail schema (refresh every run)
+    Each run MUST update this document with the following fields, exactly:
+      - Backup ID:                <id-string>
+      - Snapshot captured at:     <ISO-8601 timestamp> (epoch=<int>)
+      - Artifact bytes:           <int>
+      - Restore proof:            key_count_at_snapshot=<int>, rdb_magic_ok=<bool>
+    On a failed run, the document MUST contain one of: failed | failure | blocked | unsafe | error.
 
     ### Current State
     - Backup CronJob: valkey-state-backup (runs hourly at :17)
-    - Artifact storage: ephemeral pod-local scratch (/backups)
-    - Validation: snapshot existence only
+    - Artifact storage: ephemeral pod-local scratch (/backups) — NOT durable
+    - Validation: snapshot existence only — does NOT prove freshness
     - Retention: 3 successful job history entries
 
-    ### Known Gaps
+    ### Known Gaps (the runbook items to close)
     - The backup script does not prove the captured snapshot is current.
     - The run note has historically lagged behind the actual run.
+    - The CronJob runs as the glitchtip namespace's `default` ServiceAccount —
+      a dedicated, narrowly-scoped SA for the backup job is the platform
+      standard. (`backup-drift-reconciler-sa` is for the reconciler only —
+      do NOT reuse it for the backup CronJob.)
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -476,14 +489,35 @@ metadata:
 data:
   handoff.json: |
     {
+      "_schema_doc": "Downstream recovery tooling reads this file. Every backup run MUST overwrite this with the schema below — refer to glitchtip-valkey-backup-status/status.md for the human-readable contract.",
+      "_required_keys_on_success": [
+        "latest_run", "backup_id", "result", "safe_for_restore",
+        "snapshot_epoch", "artifact_bytes", "artifact_location", "restore_proof"
+      ],
+      "_required_keys_on_failure": [
+        "latest_run", "result", "safe_for_restore", "reason"
+      ],
+      "_artifact_location_shape": {
+        "type": "configmap | cm | secret | pvc",
+        "name_or_claim": "<resource name>",
+        "key_or_path": "<data key for cm/secret, mount path for pvc>",
+        "namespace": "<resource namespace, optional>"
+      },
+      "_restore_proof_shape": {
+        "key_count_at_snapshot": "<int, must be > 0 and reflect a real DBSIZE>",
+        "rdb_magic_ok": "<bool>"
+      },
       "latest_run": "2026-03-30T02:17:11Z",
+      "backup_id": "valkey-20260330_021711",
       "result": "success",
       "safe_for_restore": true,
+      "snapshot_epoch": 1711761431,
       "artifact_bytes": 214562,
-      "notes": [
-        "Downstream recovery tooling checks this handoff before restoring.",
-        "This record is stale until the current pipeline refreshes it."
-      ]
+      "artifact_location": {
+        "type": "ephemeral",
+        "note": "current pipeline writes to emptyDir — NOT durable, must be replaced"
+      },
+      "restore_proof": null
     }
 EOF
 
@@ -508,6 +542,8 @@ kind: ServiceAccount
 metadata:
   name: backup-drift-reconciler-sa
   namespace: glitchtip
+  annotations:
+    purpose: "ONLY for the drift-reconciler CronJob. Do NOT reuse for the valkey-state-backup job — that needs its own dedicated, narrowly-scoped SA."
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
