@@ -52,34 +52,38 @@ NS=glitchtip
 STATUS_CM=glitchtip-valkey-backup-status
 HANDOFF_CM=glitchtip-valkey-backup-restore-handoff
 
-json_str() {
-  # IMPORTANT: busybox sed treats `\"` in the replacement as just `"`, which
-  # silently drops the backslash and breaks nested-JSON escaping. Use the
-  # `\&` match-backreference trick instead so both GNU and busybox sed
-  # produce a real `\"`.
-  sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\&/g;s/\n/\\n/g' | sed 's/^/"/;s/$/"/'
-}
-
+# Send a server-side-apply patch using application/apply-patch+yaml.
+# YAML's `|` block literal preserves the inner content verbatim, which
+# sidesteps every nested-JSON escaping nightmare that merge-patch+json
+# imposes on a busybox/alpine shell. The `content_file` is the raw
+# value (markdown or JSON) that ends up as `data.<key>`.
 patch_cm() {
-  cm="$1"; key="$2"; val="$3"
-  bf="/tmp/patch-${cm}-$$.json"
-  # printf with %s avoids any shell re-interpretation of backslashes/quotes
-  # inside the already-json_str-quoted value. `val` is "...\"escaped\"..." .
-  printf '{"data":{"%s":%s}}' "${key}" "${val}" > "${bf}"
-  bsize=$(wc -c < "${bf}" | tr -d '[:space:]')
+  cm="$1"; key="$2"; content_file="$3"
+  bf="/tmp/apply-${cm}-$$.yaml"
+  {
+    printf 'apiVersion: v1\n'
+    printf 'kind: ConfigMap\n'
+    printf 'metadata:\n'
+    printf '  name: %s\n' "${cm}"
+    printf '  namespace: %s\n' "${NS}"
+    printf 'data:\n'
+    printf '  %s: |\n' "${key}"
+    # Indent every line of the value by 4 spaces (YAML block literal).
+    sed 's/^/    /' "${content_file}"
+  } > "${bf}"
   _rc=0
   _out=$(curl -sS --cacert "${CA}" \
     -X PATCH \
     -H "Authorization: Bearer ${TOKEN}" \
-    -H "Content-Type: application/merge-patch+json" \
+    -H "Content-Type: application/apply-patch+yaml" \
     --data-binary "@${bf}" \
     -w 'HTTP:%{http_code}' \
-    "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}" 2>&1) || _rc=$?
+    "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}?fieldManager=valkey-backup&force=true" 2>&1) || _rc=$?
   _http=$(printf '%s' "${_out}" | sed -n 's/.*HTTP:\([0-9]\+\).*/\1/p' | tail -1)
   if [ "${_rc}" != "0" ] || { [ "${_http}" != "200" ] && [ "${_http}" != "201" ]; }; then
-    _body_head=$(head -c 300 "${bf}" 2>/dev/null)
-    _resp_head=$(printf '%s' "${_out}" | head -c 300)
-    echo "[backup] patch_cm ${cm}/${key} FAIL rc=${_rc} http=${_http} bsize=${bsize}"
+    _body_head=$(head -c 400 "${bf}" 2>/dev/null)
+    _resp_head=$(printf '%s' "${_out}" | head -c 400)
+    echo "[backup] patch_cm ${cm}/${key} FAIL rc=${_rc} http=${_http}"
     echo "[backup]   body head: ${_body_head}"
     echo "[backup]   response head: ${_resp_head}"
     return 1
@@ -90,22 +94,25 @@ patch_cm() {
 
 publish_failure() {
   reason="$1"
-  reason_json=$(printf '%s' "${reason}" | json_str)
-  handoff="{\"latest_run\":\"${NOW_UTC}\",\"backup_id\":\"${BACKUP_ID}\",\"result\":\"failed\",\"safe_for_restore\":false,\"snapshot_epoch\":0,\"artifact_bytes\":0,\"artifact_location\":null,\"restore_proof\":null,\"reason\":${reason_json}}"
-  handoff_esc=$(printf '%s' "${handoff}" | json_str)
-  patch_cm "${HANDOFF_CM}" "handoff.json" "${handoff_esc}" || true
-  status_md="# Valkey backup run ${BACKUP_ID}
+  # Sanitize the reason so we can embed it in a JSON string literal
+  # without any escaping — strip quotes/backslashes/newlines.
+  reason_clean=$(printf '%s' "${reason}" | tr '"\\' "''" | tr '\n' ' ' | head -c 250)
+  cat > /tmp/handoff-body.json <<HEOF
+{"latest_run":"${NOW_UTC}","backup_id":"${BACKUP_ID}","result":"failed","safe_for_restore":false,"snapshot_epoch":0,"artifact_bytes":0,"artifact_location":null,"restore_proof":null,"reason":"${reason_clean}"}
+HEOF
+  patch_cm "${HANDOFF_CM}" "handoff.json" "/tmp/handoff-body.json" || true
+  cat > /tmp/status-body.md <<SEOF
+# Valkey backup run ${BACKUP_ID}
 **Status: FAILED**
 - Timestamp: ${NOW_UTC}
 - Backup ID: ${BACKUP_ID}
 - Snapshot timestamp: (not produced)
 - Artifact bytes: 0
 - Restore proof: (not produced)
-- Reason: ${reason}
-"
-  status_esc=$(printf '%s' "${status_md}" | json_str)
-  patch_cm "${STATUS_CM}" "status.md" "${status_esc}" || true
-  echo "[backup] FAILED: ${reason}"
+- Reason: ${reason_clean}
+SEOF
+  patch_cm "${STATUS_CM}" "status.md" "/tmp/status-body.md" || true
+  echo "[backup] FAILED: ${reason_clean}"
   exit 1
 }
 
@@ -215,7 +222,10 @@ fi
 echo "[backup] step: artifact persisted"
 
 # 6) Publish truthful status + handoff.
-STATUS_MD="# Valkey backup run ${BACKUP_ID}
+# Write success surfaces as plain files; YAML server-side-apply (see
+# patch_cm) embeds them verbatim via `|` block literal.
+cat > /tmp/status-body.md <<SEOF
+# Valkey backup run ${BACKUP_ID}
 **Status: SUCCESS**
 - Timestamp: ${NOW_UTC}
 - Backup ID: ${BACKUP_ID}
@@ -223,13 +233,13 @@ STATUS_MD="# Valkey backup run ${BACKUP_ID}
 - Artifact bytes: ${SIZE}
 - Artifact location: configmap/${ARTIFACT_CM}/dump.rdb
 - Restore proof: key_count_at_snapshot=${DBSIZE}, magic=REDIS, lastsave_advanced=${PREV_LASTSAVE}->${NEW_LASTSAVE}
-"
-STATUS_ESC=$(printf '%s' "${STATUS_MD}" | json_str)
-patch_cm "${STATUS_CM}" "status.md" "${STATUS_ESC}" || publish_failure "failed to publish status"
+SEOF
+patch_cm "${STATUS_CM}" "status.md" "/tmp/status-body.md" || publish_failure "failed to publish status"
 
-HANDOFF="{\"latest_run\":\"${NOW_UTC}\",\"backup_id\":\"${BACKUP_ID}\",\"result\":\"success\",\"safe_for_restore\":true,\"snapshot_epoch\":${NEW_LASTSAVE},\"artifact_bytes\":${SIZE},\"artifact_location\":{\"type\":\"configmap\",\"name\":\"${ARTIFACT_CM}\",\"key\":\"dump.rdb\",\"namespace\":\"${NS}\"},\"restore_proof\":{\"key_count_at_snapshot\":${DBSIZE},\"rdb_magic_ok\":true,\"lastsave_before\":${PREV_LASTSAVE},\"lastsave_after\":${NEW_LASTSAVE}},\"reason\":\"backup produced a fresh snapshot with verified magic bytes and non-zero key count\"}"
-HANDOFF_ESC=$(printf '%s' "${HANDOFF}" | json_str)
-patch_cm "${HANDOFF_CM}" "handoff.json" "${HANDOFF_ESC}" || publish_failure "failed to publish handoff"
+cat > /tmp/handoff-body.json <<HEOF
+{"latest_run":"${NOW_UTC}","backup_id":"${BACKUP_ID}","result":"success","safe_for_restore":true,"snapshot_epoch":${NEW_LASTSAVE},"artifact_bytes":${SIZE},"artifact_location":{"type":"configmap","name":"${ARTIFACT_CM}","key":"dump.rdb","namespace":"${NS}"},"restore_proof":{"key_count_at_snapshot":${DBSIZE},"rdb_magic_ok":true,"lastsave_before":${PREV_LASTSAVE},"lastsave_after":${NEW_LASTSAVE}},"reason":"backup produced a fresh snapshot with verified magic bytes and non-zero key count"}
+HEOF
+patch_cm "${HANDOFF_CM}" "handoff.json" "/tmp/handoff-body.json" || publish_failure "failed to publish handoff"
 
 echo "[backup] ${BACKUP_ID}: SUCCESS (size=${SIZE}, keys=${DBSIZE}, lastsave ${PREV_LASTSAVE}->${NEW_LASTSAVE})"
 SCRIPT_EOF
