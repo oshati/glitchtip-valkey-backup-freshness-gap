@@ -38,7 +38,9 @@ ls -la /tools/ 2>/dev/null || true
 echo "[backup] curl version:"
 curl --version 2>&1 | head -2 || echo "[backup] curl failed to run"
 
-TS=$(date +%Y%m%d_%H%M%S)
+# RFC 1123 subdomain (lowercase, hyphens only — no underscores) so that
+# `valkey-backup-${TS}` is a valid ConfigMap name.
+TS=$(date +%Y%m%d-%H%M%S)
 BACKUP_ID="valkey-${TS}"
 OUT="/backups/dump-${TS}.rdb"
 mkdir -p /backups
