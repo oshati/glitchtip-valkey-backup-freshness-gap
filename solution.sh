@@ -58,22 +58,29 @@ json_str() {
 
 patch_cm() {
   cm="$1"; key="$2"; val="$3"
-  body="{\"data\":{\"${key}\":${val}}}"
-  bsize=$(printf '%s' "${body}" | wc -c | tr -d '[:space:]')
+  bf="/tmp/patch-${cm}-$$.json"
+  # printf with %s avoids any shell re-interpretation of backslashes/quotes
+  # inside the already-json_str-quoted value. `val` is "...\"escaped\"..." .
+  printf '{"data":{"%s":%s}}' "${key}" "${val}" > "${bf}"
+  bsize=$(wc -c < "${bf}" | tr -d '[:space:]')
   _rc=0
   _out=$(curl -sS --cacert "${CA}" \
     -X PATCH \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Content-Type: application/merge-patch+json" \
-    -d "${body}" \
+    --data-binary "@${bf}" \
     -w 'HTTP:%{http_code}' \
     "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}" 2>&1) || _rc=$?
   _http=$(printf '%s' "${_out}" | sed -n 's/.*HTTP:\([0-9]\+\).*/\1/p' | tail -1)
   if [ "${_rc}" != "0" ] || { [ "${_http}" != "200" ] && [ "${_http}" != "201" ]; }; then
-    _head=$(printf '%s' "${_out}" | head -c 400)
-    echo "[backup] patch_cm ${cm}/${key} FAIL rc=${_rc} http=${_http} bsize=${bsize}: ${_head}"
+    _body_head=$(head -c 300 "${bf}" 2>/dev/null)
+    _resp_head=$(printf '%s' "${_out}" | head -c 300)
+    echo "[backup] patch_cm ${cm}/${key} FAIL rc=${_rc} http=${_http} bsize=${bsize}"
+    echo "[backup]   body head: ${_body_head}"
+    echo "[backup]   response head: ${_resp_head}"
     return 1
   fi
+  rm -f "${bf}" 2>/dev/null || true
   return 0
 }
 
