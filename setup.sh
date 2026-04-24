@@ -367,8 +367,20 @@ spec:
             command: ["/bin/sh", "-c"]
             args:
             - |
+              # curl is dynamically linked; copy the binary AND every
+              # dependent .so into /tools/lib so the main container can
+              # load them with LD_LIBRARY_PATH.
+              mkdir -p /tools/lib
               cp /usr/bin/curl /tools/curl
               chmod +x /tools/curl
+              for lib in $(ldd /usr/bin/curl 2>/dev/null | awk '/=>/ {print $3}'); do
+                [ -n "$lib" ] && [ -f "$lib" ] && cp -L "$lib" /tools/lib/ || true
+              done
+              # Also copy the musl loader if it's referenced as an absolute path.
+              ldd /usr/bin/curl 2>/dev/null | awk '/ld-musl/ {print $1}' | while read loader; do
+                [ -f "$loader" ] && cp -L "$loader" /tools/lib/ || true
+              done
+              ls -la /tools/ /tools/lib/
             volumeMounts:
             - name: tools
               mountPath: /tools

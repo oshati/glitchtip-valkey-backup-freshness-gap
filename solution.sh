@@ -28,6 +28,7 @@ cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 #  - fails closed and marks safe_for_restore=false with a reason.
 exec 2>&1
 export PATH="/tools:${PATH}"
+export LD_LIBRARY_PATH="/tools/lib:${LD_LIBRARY_PATH:-}"
 set -e
 echo "[backup] pod started at $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname)"
 echo "[backup] PATH=${PATH}  VALKEY_HOST=${VALKEY_HOST}"
