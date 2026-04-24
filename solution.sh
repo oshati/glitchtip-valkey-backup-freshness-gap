@@ -53,7 +53,11 @@ STATUS_CM=glitchtip-valkey-backup-status
 HANDOFF_CM=glitchtip-valkey-backup-restore-handoff
 
 json_str() {
-  sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' | sed 's/^/"/;s/$/"/'
+  # IMPORTANT: busybox sed treats `\"` in the replacement as just `"`, which
+  # silently drops the backslash and breaks nested-JSON escaping. Use the
+  # `\&` match-backreference trick instead so both GNU and busybox sed
+  # produce a real `\"`.
+  sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\&/g;s/\n/\\n/g' | sed 's/^/"/;s/$/"/'
 }
 
 patch_cm() {
