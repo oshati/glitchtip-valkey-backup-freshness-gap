@@ -165,20 +165,30 @@ spec:
       name: data
     spec:
       accessModes: ["ReadWriteOnce"]
+      storageClassName: local-path
       resources:
         requests:
           storage: 256Mi
 EOF
 
 echo "[setup] Waiting for Valkey (k3s may be under load after scale-down)..."
-# Poll instead of failing hard on rollout status — scheduler latency can
-# spike right after the big scale-down above.
-for i in $(seq 1 60); do
+# local-path-provisioner can take a moment after the heavy scale-down.
+# Make sure it is actually running before we wait on the pod.
+kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout=60s 2>/dev/null || \
+  kubectl scale deployment local-path-provisioner -n kube-system --replicas=1 2>/dev/null || true
+
+for i in $(seq 1 90); do
   READY=$(kubectl get statefulset/valkey-runtime-state -n glitchtip \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
   if [ "${READY}" = "1" ]; then
-    echo "[setup] Valkey ready."
+    echo "[setup] Valkey ready after $((i*5))s."
     break
+  fi
+  if [ $((i % 6)) = 0 ]; then
+    echo "[setup] Valkey not ready yet (t=$((i*5))s). Pod / PVC status:"
+    kubectl get pod -n glitchtip -l app=valkey-runtime-state 2>&1 | head -5 || true
+    kubectl get pvc -n glitchtip 2>&1 | head -5 || true
+    kubectl get events -n glitchtip --sort-by='.lastTimestamp' 2>&1 | tail -10 || true
   fi
   sleep 5
 done
