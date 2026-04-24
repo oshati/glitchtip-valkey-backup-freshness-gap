@@ -29,7 +29,11 @@ cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 exec 2>&1
 export PATH="/tools:${PATH}"
 export LD_LIBRARY_PATH="/tools/lib:${LD_LIBRARY_PATH:-}"
-set -e
+# Intentionally NOT using `set -e`: the script's whole contract is to fail
+# CLOSED by publishing a truthful failure handoff/status, not to die silently.
+# With `set -e`, a failing command substitution (e.g. BGSAVE_OUT=$(valkey-cli
+# ... 2>&1) when Valkey is scaled to 0) kills the script BEFORE the explicit
+# error check + publish_failure can run, leaving a stale handoff.
 echo "[backup] pod started at $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname)"
 echo "[backup] PATH=${PATH}  VALKEY_HOST=${VALKEY_HOST}"
 which valkey-cli || true
