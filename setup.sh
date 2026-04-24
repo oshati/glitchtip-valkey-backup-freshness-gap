@@ -170,9 +170,19 @@ spec:
           storage: 256Mi
 EOF
 
-echo "[setup] Waiting for Valkey..."
-kubectl rollout status statefulset/valkey-runtime-state -n glitchtip --timeout=180s
-kubectl wait --for=condition=ready pod -l app=valkey-runtime-state -n glitchtip --timeout=120s
+echo "[setup] Waiting for Valkey (k3s may be under load after scale-down)..."
+# Poll instead of failing hard on rollout status — scheduler latency can
+# spike right after the big scale-down above.
+for i in $(seq 1 60); do
+  READY=$(kubectl get statefulset/valkey-runtime-state -n glitchtip \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  if [ "${READY}" = "1" ]; then
+    echo "[setup] Valkey ready."
+    break
+  fi
+  sleep 5
+done
+kubectl wait --for=condition=ready pod -l app=valkey-runtime-state -n glitchtip --timeout=120s || true
 
 VALKEY_POD="valkey-runtime-state-0"
 
