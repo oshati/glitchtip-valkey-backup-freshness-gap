@@ -59,13 +59,22 @@ json_str() {
 patch_cm() {
   cm="$1"; key="$2"; val="$3"
   body="{\"data\":{\"${key}\":${val}}}"
-  curl -sS --fail --cacert "${CA}" \
+  bsize=$(printf '%s' "${body}" | wc -c | tr -d '[:space:]')
+  _rc=0
+  _out=$(curl -sS --cacert "${CA}" \
     -X PATCH \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Content-Type: application/merge-patch+json" \
     -d "${body}" \
-    "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}" \
-    >/dev/null 2>&1 || return 1
+    -w 'HTTP:%{http_code}' \
+    "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${cm}" 2>&1) || _rc=$?
+  _http=$(printf '%s' "${_out}" | sed -n 's/.*HTTP:\([0-9]\+\).*/\1/p' | tail -1)
+  if [ "${_rc}" != "0" ] || { [ "${_http}" != "200" ] && [ "${_http}" != "201" ]; }; then
+    _head=$(printf '%s' "${_out}" | head -c 400)
+    echo "[backup] patch_cm ${cm}/${key} FAIL rc=${_rc} http=${_http} bsize=${bsize}: ${_head}"
+    return 1
+  fi
+  return 0
 }
 
 publish_failure() {
