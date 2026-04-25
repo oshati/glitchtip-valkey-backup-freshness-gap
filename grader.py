@@ -168,20 +168,45 @@ metadata:
     app: grader-restore-probe
 spec:
   restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
   containers:
   - name: probe
     image: docker.io/valkey/valkey:7.2-alpine
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
     command: ["sh", "-c"]
     args:
     - |
       set -e
+      echo "[probe] copying RDB..."
       cp /rdb/dump.rdb /data/dump.rdb
-      chown -R valkey:valkey /data 2>/dev/null || true
-      valkey-server --dir /data --dbfilename dump.rdb --daemonize no --port 6390 &
-      sleep 4
-      valkey-cli -p 6390 KEYS '*' > /tmp/keys.out 2>/dev/null || true
-      cat /tmp/keys.out
-      sleep 50
+      chmod 644 /data/dump.rdb
+      ls -la /data/
+      echo "[probe] starting valkey-server..."
+      valkey-server --dir /data --dbfilename dump.rdb --port 6390 \\
+        --daemonize no --bind 127.0.0.1 --protected-mode no \\
+        --logfile /tmp/valkey.log &
+      VPID=$!
+      echo "[probe] valkey pid=$VPID — waiting up to 30s for ready..."
+      for i in $(seq 1 30); do
+        if valkey-cli -p 6390 PING 2>/dev/null | grep -q PONG; then
+          echo "[probe] PONG after ${{i}}s"
+          break
+        fi
+        sleep 1
+      done
+      echo "[probe] DBSIZE:"
+      valkey-cli -p 6390 DBSIZE 2>/dev/null || echo "DBSIZE-fail"
+      echo "[probe] === KEYS BEGIN ==="
+      valkey-cli -p 6390 KEYS '*' 2>/dev/null || echo "KEYS-fail"
+      echo "[probe] === KEYS END ==="
+      echo "[probe] valkey-server log tail:"
+      tail -40 /tmp/valkey.log 2>/dev/null || true
+      sleep 60
     volumeMounts:
     - name: rdb
       mountPath: /rdb
@@ -205,8 +230,9 @@ spec:
     matched = set()
     missing = set(expected_keys)
     err_msg = None
+    last_logs = ""
     try:
-        for _ in range(15):
+        for _ in range(20):
             time.sleep(4)
             rc, phase, _ = run_cmd(
                 f"kubectl get pod {probe} -n {NAMESPACE} "
@@ -219,15 +245,32 @@ spec:
                     f"kubectl logs {probe} -n {NAMESPACE} 2>/dev/null",
                     timeout=15,
                 )
-                keyset = {ln.strip() for ln in logs.splitlines() if ln.strip()}
-                matched = {k for k in expected_keys if k in keyset}
-                missing = {k for k in expected_keys if k not in keyset}
-                err_msg = None
-                if matched or len(keyset) > 0:
+                last_logs = logs
+                # Extract only the lines between KEYS BEGIN / KEYS END
+                keyset = set()
+                in_keys = False
+                for ln in logs.splitlines():
+                    s = ln.strip()
+                    if "=== KEYS BEGIN ===" in s:
+                        in_keys = True
+                        continue
+                    if "=== KEYS END ===" in s:
+                        in_keys = False
+                        break
+                    if in_keys and s:
+                        keyset.add(s)
+                if "=== KEYS END ===" in logs:
+                    matched = {k for k in expected_keys if k in keyset}
+                    missing = {k for k in expected_keys if k not in keyset}
                     break
             if phase == "Failed":
                 err_msg = "probe pod entered Failed phase"
                 break
+        if not matched and not err_msg:
+            err_msg = (
+                "probe pod did not reach KEYS-output stage in time. "
+                f"log tail: {last_logs[-400:]}"
+            )
     finally:
         run_cmd(f"kubectl delete pod {probe} -n {NAMESPACE} --grace-period=0 "
                 f"--force --ignore-not-found 2>/dev/null", timeout=15)
