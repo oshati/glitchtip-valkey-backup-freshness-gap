@@ -499,7 +499,10 @@ data:
         "key_count_at_snapshot": "<int, must be > 0 and reflect a real DBSIZE>",
         "rdb_magic_ok": "<bool>"
       },
-      "_freshness_contract": "Each successful publish MUST set snapshot_epoch to the strictly-greater value than the previous publish (monotonic). The artifact_bytes value here MUST equal the bytes count reported in glitchtip-valkey-backup-status/status.md.",
+      "_freshness_contract": "Each successful publish MUST set snapshot_epoch strictly greater than the previous publish (monotonic). The artifact_bytes value here MUST equal the bytes count reported in glitchtip-valkey-backup-status/status.md.",
+      "_integrity_contract": "Each successful publish MUST include 'artifact_sha256': the lowercase 64-char hex digest of the bytes actually stored in artifact_location. Recovery tooling refuses to load any artifact whose retrieved sha256 disagrees with this field.",
+      "_audit_contract": "Each successful publish MUST include 'previous_run': {snapshot_epoch:<int>, backup_id:<str>} carried forward from the prior publish. The backup script must READ this file before WRITING — overwriting handoff blind loses the audit chain.",
+      "_restorability_contract": "The artifact at artifact_location MUST, when loaded into a clean Valkey instance, restore the same key set that was live at snapshot_epoch (>=90% match). Recovery tooling validates this by spinning up a probe Valkey and running KEYS *.",
       "latest_run": "2026-03-30T02:17:11Z",
       "backup_id": "valkey-20260330_021711",
       "result": "success",
@@ -508,6 +511,7 @@ data:
         "type": "ephemeral",
         "note": "current pipeline writes to emptyDir — NOT durable, must be replaced"
       },
+      "previous_run": null,
       "restore_proof": null
     }
 EOF

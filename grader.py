@@ -113,6 +113,129 @@ def valkey_cli(cmd, timeout=10):
     return out.strip() if rc == 0 else ""
 
 
+def write_marker_key(marker_name, marker_value):
+    """Write a freshness-proof key directly into Valkey via kubectl exec.
+    The key MUST appear in any RDB captured AFTER this call."""
+    safe_value = marker_value.replace('"', '\\"')
+    rc, _, _ = run_cmd(
+        f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- valkey-cli "
+        f"SET {shlex.quote(marker_name)} {shlex.quote(safe_value)}",
+        timeout=10,
+    )
+    return rc == 0
+
+
+def rdb_contains_marker(rdb_bytes, marker_name, marker_value):
+    """RDB serializes string keys+values literally as length-prefixed bytes.
+    A simple substring search on the raw bytes is sufficient to prove the
+    marker was present at BGSAVE time — agents cannot fake this without
+    actually capturing post-marker state."""
+    if not rdb_bytes:
+        return False
+    try:
+        name_b = marker_name.encode("utf-8")
+        value_b = marker_value.encode("utf-8")
+    except Exception:
+        return False
+    return name_b in rdb_bytes and value_b in rdb_bytes
+
+
+def restore_probe_keyset(rdb_bytes, expected_keys):
+    """Spin up an isolated Valkey probe pod, load the agent's RDB, run
+    KEYS *. Returns (matched_keys, missing_keys, error_or_None).
+    Caps probe pod boot at 60s — flaky infra fails fairly with diagnostic."""
+    import base64 as _b64
+    ts = int(time.time())
+    probe = f"grader-restore-probe-{ts}"
+    rdb_b64 = _b64.b64encode(rdb_bytes).decode("ascii")
+    cm_name = f"grader-restore-rdb-{ts}"
+    cm_yaml = (
+        f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {cm_name}\n  "
+        f"namespace: {NAMESPACE}\nbinaryData:\n  dump.rdb: {rdb_b64}\n"
+    )
+    rc, _, err = run_cmd(
+        f"echo {shlex.quote(cm_yaml)} | kubectl apply -f -",
+        timeout=20,
+    )
+    if rc != 0:
+        return set(), set(expected_keys), f"failed to stage RDB CM: {err[:200]}"
+    pod_yaml = f"""apiVersion: v1
+kind: Pod
+metadata:
+  name: {probe}
+  namespace: {NAMESPACE}
+  labels:
+    app: grader-restore-probe
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: docker.io/valkey/valkey:7.2-alpine
+    command: ["sh", "-c"]
+    args:
+    - |
+      set -e
+      cp /rdb/dump.rdb /data/dump.rdb
+      chown -R valkey:valkey /data 2>/dev/null || true
+      valkey-server --dir /data --dbfilename dump.rdb --daemonize no --port 6390 &
+      sleep 4
+      valkey-cli -p 6390 KEYS '*' > /tmp/keys.out 2>/dev/null || true
+      cat /tmp/keys.out
+      sleep 50
+    volumeMounts:
+    - name: rdb
+      mountPath: /rdb
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: rdb
+    configMap:
+      name: {cm_name}
+  - name: data
+    emptyDir: {{}}
+"""
+    rc, _, err = run_cmd(
+        f"echo {shlex.quote(pod_yaml)} | kubectl apply -f -",
+        timeout=15,
+    )
+    if rc != 0:
+        run_cmd(f"kubectl delete cm {cm_name} -n {NAMESPACE} --ignore-not-found",
+                timeout=10)
+        return set(), set(expected_keys), f"failed to launch probe pod: {err[:200]}"
+    matched = set()
+    missing = set(expected_keys)
+    err_msg = None
+    try:
+        for _ in range(15):
+            time.sleep(4)
+            rc, phase, _ = run_cmd(
+                f"kubectl get pod {probe} -n {NAMESPACE} "
+                f"-o jsonpath='{{.status.phase}}' 2>/dev/null",
+                timeout=10,
+            )
+            phase = phase.strip().strip("'")
+            if phase in ("Running", "Succeeded"):
+                rc, logs, _ = run_cmd(
+                    f"kubectl logs {probe} -n {NAMESPACE} 2>/dev/null",
+                    timeout=15,
+                )
+                keyset = {ln.strip() for ln in logs.splitlines() if ln.strip()}
+                matched = {k for k in expected_keys if k in keyset}
+                missing = {k for k in expected_keys if k not in keyset}
+                err_msg = None
+                if matched or len(keyset) > 0:
+                    break
+            if phase == "Failed":
+                err_msg = "probe pod entered Failed phase"
+                break
+    finally:
+        run_cmd(f"kubectl delete pod {probe} -n {NAMESPACE} --grace-period=0 "
+                f"--force --ignore-not-found 2>/dev/null", timeout=15)
+        run_cmd(f"kubectl delete cm {cm_name} -n {NAMESPACE} --ignore-not-found",
+                timeout=10)
+    return matched, missing, err_msg
+
+
 def get_lastsave():
     out = valkey_cli("LASTSAVE")
     try:
@@ -403,9 +526,7 @@ def check_backup_enforces_snapshot_freshness(setup_info):
         time.sleep(2)
 
     # Snapshot the previously-published snapshot_epoch so we can require
-    # strict monotonic advance after the clean run. Catches agents who
-    # publish a copy of the seeded baseline epoch without producing a
-    # genuinely fresh snapshot.
+    # strict monotonic advance after the clean run.
     pre_handoff = parse_handoff(get_handoff_doc()) or {}
     prior_snapshot_epoch = pre_handoff.get("snapshot_epoch")
     if not isinstance(prior_snapshot_epoch, int):
@@ -417,6 +538,16 @@ def check_backup_enforces_snapshot_freshness(setup_info):
     marker = f"GRADER-FRESH-{ts}"
     set_status_marker(marker)
     set_handoff_marker(marker)
+
+    # Cryptographic freshness proof: write a unique marker key DIRECTLY
+    # into Valkey BEFORE triggering backup. The agent's stored RDB MUST
+    # contain this key — proves the snapshot was captured post-marker
+    # and not recycled / forged. Agents who don't actually run BGSAVE
+    # against live Valkey after this write physically cannot pass.
+    rdb_marker_name = f"grader:freshness:{ts}"
+    rdb_marker_value = f"PROOF-{ts}-NONCE-{os.urandom(8).hex()}"
+    if not write_marker_key(rdb_marker_name, rdb_marker_value):
+        return 0.0, "grader could not write freshness marker into Valkey"
 
     job = f"grader-fresh-{ts}"
     completed, logs, err = trigger_backup(job, wait_seconds=240)
@@ -449,6 +580,26 @@ def check_backup_enforces_snapshot_freshness(setup_info):
             f"Valkey LASTSAVE did not advance "
             f"(before={lastsave_before}, after={lastsave_after}) "
             "— BGSAVE/SYNC never fired"
+        )
+
+    # Marker-key proof: retrieve agent's stored artifact and verify the
+    # grader-injected marker is present inside the RDB bytes. This is
+    # unforgeable — agents who copy / fake metadata without actually
+    # capturing fresh Valkey state cannot satisfy it.
+    location = parsed.get("artifact_location")
+    if not isinstance(location, dict):
+        return 0.0, "freshness check needs artifact_location dict to verify marker"
+    rdb_bytes, art_err = read_artifact_bytes(location)
+    if art_err or not rdb_bytes:
+        return 0.0, (
+            "could not retrieve agent's stored artifact to verify freshness "
+            f"marker: {art_err or 'no bytes'}"
+        )
+    if not rdb_contains_marker(rdb_bytes, rdb_marker_name, rdb_marker_value):
+        return 0.0, (
+            f"freshness marker key '{rdb_marker_name}' (value PROOF-{ts}-...) "
+            "is NOT present in the captured RDB — the snapshot does not "
+            "reflect Valkey state at the moment backup was requested"
         )
 
     # Forced-failure scenario: scale Valkey to 0 and run backup. Must fail closed.
@@ -557,9 +708,9 @@ def check_backup_artifact_durable_and_reusable(setup_info):
             "handoff.restore_proof.key_count_at_snapshot <= 0 — "
             "backup did not capture any live state"
         )
-    if live_dbsize > 0 and key_count < max(1, live_dbsize // 3):
+    if live_dbsize > 0 and key_count < max(1, int(live_dbsize * 0.9)):
         return 0.0, (
-            f"restore_proof.key_count_at_snapshot={key_count} is far below live "
+            f"restore_proof.key_count_at_snapshot={key_count} below 90% of live "
             f"DBSIZE={live_dbsize} — backup is not capturing the real dataset"
         )
     artifact_bytes_reported = parsed.get("artifact_bytes")
@@ -571,9 +722,37 @@ def check_backup_artifact_durable_and_reusable(setup_info):
             f"retrieved artifact size ({len(artifact)} bytes)"
         )
 
+    # END-TO-END RESTORE VERIFICATION: spin up an isolated probe Valkey
+    # pod, load the agent's stored RDB, run KEYS *. The captured key set
+    # must contain >=90% of the live Valkey key set AND must include the
+    # specific seeded keys the task pre-populates. This is the literal
+    # meaning of "safe_for_restore=true" — if a probe Valkey can't
+    # recover the dataset from this artifact, the backup is theatre.
+    rc, live_keys_raw, _ = run_cmd(
+        f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- valkey-cli KEYS '*'",
+        timeout=15,
+    )
+    live_keys = {ln.strip() for ln in live_keys_raw.splitlines() if ln.strip()}
+    if not live_keys:
+        return 0.0, "could not read live Valkey key set for restore comparison"
+    matched, missing, probe_err = restore_probe_keyset(artifact, live_keys)
+    if probe_err and not matched:
+        return 0.0, (
+            f"restore probe pod failed: {probe_err}. Without proof the artifact "
+            "is loadable, durable+reusable cannot be claimed."
+        )
+    match_ratio = len(matched) / max(1, len(live_keys))
+    if match_ratio < 0.90:
+        return 0.0, (
+            f"restored Valkey from agent's artifact recovered only "
+            f"{len(matched)}/{len(live_keys)} keys ({match_ratio:.0%}) — "
+            f"need >=90%. Missing sample: {sorted(list(missing))[:5]}"
+        )
+
     return 1.0, (
-        f"artifact durable and reusable: {loc_type}, {len(artifact)} bytes, "
-        f"restore_proof key_count={key_count} / live DBSIZE={live_dbsize}"
+        f"artifact durable+reusable+restorable: {loc_type}, {len(artifact)} bytes, "
+        f"restore probe matched {len(matched)}/{len(live_keys)} keys "
+        f"({match_ratio:.0%}) / restore_proof.key_count={key_count}"
     )
 
 
@@ -628,34 +807,110 @@ def check_status_and_handoff_surface_truth(setup_info):
     if parsed.get("safe_for_restore") is not True:
         return 0.0, "handoff.safe_for_restore != true on clean run"
 
-    # Cross-doc consistency: status.md MUST report the same numeric values
-    # as handoff.json. Fill-in-the-blanks templates pass the regex above
-    # but lie about the numbers; require artifact_bytes (and snapshot
-    # epoch when status mentions one) to match handoff to within zero.
+    # MANDATORY numeric fields in status.md (no `if found` bypass).
     h_bytes = parsed.get("artifact_bytes")
-    if isinstance(h_bytes, int):
-        bytes_in_status = re.findall(
-            r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
-            status_lower,
-        )
-        if bytes_in_status:
-            int_vals = {int(v) for v in bytes_in_status}
-            if h_bytes not in int_vals:
-                return 0.0, (
-                    f"status.md reports artifact bytes {sorted(int_vals)} but "
-                    f"handoff.json reports {h_bytes} — the two surfaces do "
-                    "not agree, restore tooling cannot trust either"
-                )
     h_epoch = parsed.get("snapshot_epoch")
-    if isinstance(h_epoch, int):
-        epoch_in_status = re.findall(r"epoch\s*[:=]\s*(\d+)", status_lower)
-        if epoch_in_status:
-            int_vals = {int(v) for v in epoch_in_status}
-            if h_epoch not in int_vals:
-                return 0.0, (
-                    f"status.md reports snapshot epoch {sorted(int_vals)} but "
-                    f"handoff.json reports {h_epoch} — surfaces disagree"
-                )
+    if not isinstance(h_bytes, int):
+        return 0.0, "handoff.artifact_bytes must be an int"
+    if not isinstance(h_epoch, int):
+        return 0.0, "handoff.snapshot_epoch must be an int"
+    bytes_in_status = re.findall(
+        r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
+        status_lower,
+    )
+    if not bytes_in_status:
+        return 0.0, (
+            "status.md MUST include a numeric artifact-bytes value "
+            "(e.g. 'Artifact bytes: 1347'); prose like 'roughly 1.3 KB' "
+            "is not parseable by recovery tooling"
+        )
+    if h_bytes not in {int(v) for v in bytes_in_status}:
+        return 0.0, (
+            f"status.md reports artifact bytes {sorted({int(v) for v in bytes_in_status})} "
+            f"but handoff.json reports {h_bytes} — surfaces disagree, "
+            "restore tooling cannot trust either"
+        )
+    epoch_in_status = re.findall(r"epoch\s*[:=]\s*(\d+)", status_lower)
+    if not epoch_in_status:
+        return 0.0, (
+            "status.md MUST include a numeric snapshot epoch "
+            "(e.g. 'epoch=1777079123')"
+        )
+    if h_epoch not in {int(v) for v in epoch_in_status}:
+        return 0.0, (
+            f"status.md reports snapshot epoch {sorted({int(v) for v in epoch_in_status})} "
+            f"but handoff.json reports {h_epoch} — surfaces disagree"
+        )
+
+    # SHA256 integrity: agent MUST publish artifact_sha256 and the value
+    # MUST match the grader-computed hash of the retrieved bytes. Catches
+    # truncated artifacts (ConfigMap 1MiB cap), corrupt writes, and
+    # agents who don't verify their own output post-write.
+    import hashlib as _h
+    handoff_sha = parsed.get("artifact_sha256")
+    if not isinstance(handoff_sha, str) or len(handoff_sha) != 64:
+        return 0.0, (
+            "handoff.artifact_sha256 missing or not a 64-char hex digest — "
+            "every backup run must verify its own artifact integrity"
+        )
+    location = parsed.get("artifact_location") or {}
+    art_bytes, art_err = read_artifact_bytes(location)
+    if art_err:
+        return 0.0, f"could not retrieve artifact for hash check: {art_err}"
+    actual_sha = _h.sha256(art_bytes).hexdigest()
+    if handoff_sha.lower() != actual_sha:
+        return 0.0, (
+            f"handoff.artifact_sha256={handoff_sha[:16]}... does not match "
+            f"grader-computed sha256={actual_sha[:16]}... — artifact corruption "
+            "or agent published a hash without actually computing it"
+        )
+
+    # LIVE resource check: handoff.artifact_location.name (or claim) MUST
+    # resolve to a real kubectl resource. Catches placeholder / fictional
+    # location names that pass the schema but point nowhere real.
+    loc_type = (location.get("type") or "").lower()
+    if loc_type in ("configmap", "cm"):
+        cm_name = location.get("name") or location.get("name_or_claim") or ""
+        cm_ns = location.get("namespace") or NAMESPACE
+        rc, _, _ = run_cmd(
+            f"kubectl get configmap {shlex.quote(cm_name)} -n {shlex.quote(cm_ns)} "
+            f"-o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return 0.0, (
+                f"handoff.artifact_location points to configmap/{cm_name} in "
+                f"namespace {cm_ns} but no such ConfigMap exists"
+            )
+    elif loc_type == "secret":
+        s_name = location.get("name") or location.get("name_or_claim") or ""
+        s_ns = location.get("namespace") or NAMESPACE
+        rc, _, _ = run_cmd(
+            f"kubectl get secret {shlex.quote(s_name)} -n {shlex.quote(s_ns)} "
+            f"-o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return 0.0, f"handoff.artifact_location points to non-existent secret/{s_name}"
+    elif loc_type == "pvc":
+        c = location.get("claim") or location.get("name_or_claim") or ""
+        c_ns = location.get("namespace") or NAMESPACE
+        rc, _, _ = run_cmd(
+            f"kubectl get pvc {shlex.quote(c)} -n {shlex.quote(c_ns)} "
+            f"-o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return 0.0, f"handoff.artifact_location points to non-existent pvc/{c}"
+
+    # AUDIT TRAIL: handoff MUST carry forward a `previous_run` field
+    # (snapshot_epoch + backup_id from the immediately preceding publish).
+    # Proves the agent reads handoff before writing — backup pipelines
+    # that overwrite history blind get caught here.
+    prev_run = parsed.get("previous_run")
+    if not isinstance(prev_run, dict):
+        return 0.0, (
+            "handoff.previous_run is missing — every refresh must carry "
+            "the prior run's snapshot_epoch + backup_id forward as audit trail"
+        )
+    if not isinstance(prev_run.get("snapshot_epoch"), int):
+        return 0.0, "handoff.previous_run.snapshot_epoch must be an int"
+    if not isinstance(prev_run.get("backup_id"), str) or not prev_run["backup_id"]:
+        return 0.0, "handoff.previous_run.backup_id missing"
 
     # Forced-failure: scale Valkey to 0, run again, expect failure surface
     ts2 = int(time.time())
@@ -848,9 +1103,65 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
             "drift control reverted the fix"
         )
 
+    # DEFAULT-SA REMOVAL STRESS TEST: setup grants the namespace `default`
+    # SA broad permissions on configmaps. If the agent's backup secretly
+    # relies on those (instead of its own scoped Role), removing default's
+    # bindings will break the next backup. A truly correct fix uses ONLY
+    # the agent's dedicated SA.
+    print("[grader] Removing namespace `default` SA bindings to test "
+          "agent's SA stands alone...")
+    rc, rb_json, _ = run_cmd(
+        f"kubectl get rolebindings -n {NAMESPACE} -o json", timeout=15,
+    )
+    saved_default_rb = []
+    try:
+        rb_data = json.loads(rb_json or "{}")
+        for rb in rb_data.get("items", []) or []:
+            for s in (rb.get("subjects") or []):
+                if (s.get("kind") == "ServiceAccount"
+                        and s.get("name") == "default"
+                        and s.get("namespace", NAMESPACE) == NAMESPACE):
+                    name = rb.get("metadata", {}).get("name")
+                    if name:
+                        saved_default_rb.append(name)
+                    break
+    except Exception:
+        saved_default_rb = []
+    for name in saved_default_rb:
+        run_cmd(
+            f"kubectl delete rolebinding {shlex.quote(name)} -n {NAMESPACE} "
+            "--ignore-not-found", timeout=10,
+        )
+    try:
+        ts3 = int(time.time())
+        marker3 = f"GRADER-NODEFAULT-{ts3}"
+        set_status_marker(marker3)
+        set_handoff_marker(marker3)
+        job3 = f"grader-nodefault-{ts3}"
+        completed3, logs3, err3 = trigger_backup(job3, wait_seconds=240)
+        handoff3 = wait_for_doc_change(get_handoff_doc, marker3)
+        cleanup_job(job3)
+        if err3 or not completed3:
+            return 0.0, (
+                "backup failed after removing namespace default SA bindings — "
+                "agent's pipeline secretly relies on default-SA permissions "
+                f"rather than its own scoped Role. logs tail:\n{logs3[-300:]}"
+            )
+        parsed3 = parse_handoff(handoff3)
+        if parsed3 is None or parsed3.get("safe_for_restore") is not True:
+            return 0.0, (
+                "after default-SA removal, agent's backup did not publish a "
+                "safe handoff — dedicated SA is not actually authorised "
+                "end-to-end without the default fallback"
+            )
+    finally:
+        # NOTE: we do NOT restore default's RoleBindings — leaving them
+        # removed for any subsequent grader phases is intentional.
+        pass
+
     return 1.0, (
-        f"repair survives drift reconciliation; backup SA '{sa}' is narrow "
-        "(status + handoff writes only)"
+        f"repair survives drift reconciliation AND default-SA removal; "
+        f"backup SA '{sa}' is narrow (status + handoff writes only)"
     )
 
 

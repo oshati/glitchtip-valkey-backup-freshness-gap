@@ -174,14 +174,35 @@ if [ ! -f "${OUT}" ]; then
   publish_failure "RDB file was not written"
 fi
 
-echo "[backup] step: validate magic + size"
+echo "[backup] step: validate magic + size + sha256"
 MAGIC=$(head -c 5 "${OUT}" 2>/dev/null || true)
 SIZE=$(wc -c < "${OUT}" | tr -d '[:space:]')
-echo "[backup] step: magic='${MAGIC}' size=${SIZE}"
+RDB_SHA256=$(sha256sum "${OUT}" 2>/dev/null | awk '{print $1}')
+[ -z "${RDB_SHA256}" ] && RDB_SHA256=$(openssl dgst -sha256 -r "${OUT}" 2>/dev/null | awk '{print $1}')
+echo "[backup] step: magic='${MAGIC}' size=${SIZE} sha256=${RDB_SHA256}"
 [ "${MAGIC}" = "REDIS" ] || publish_failure "RDB does not start with REDIS magic bytes"
 if [ "${SIZE}" -lt 200 ] 2>/dev/null; then
   publish_failure "RDB too small (${SIZE} bytes)"
 fi
+if [ -z "${RDB_SHA256}" ]; then
+  publish_failure "could not compute artifact sha256 (no sha256sum/openssl)"
+fi
+
+echo "[backup] step: reading prior handoff to carry previous_run forward"
+PRIOR_CM=$(curl -sS --cacert "${CA}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${HANDOFF_CM}" 2>/dev/null \
+  | tr '\n' ' ')
+# CM JSON has data: { "handoff.json": "<escaped JSON string>" } — escape sequences
+# include \" for quotes and \n for newlines. Simplest, busybox-safe extraction:
+PRIOR_EPOCH=$(printf '%s' "${PRIOR_CM}" | grep -oE '\\"snapshot_epoch\\":[[:space:]]*[0-9]+' \
+  | head -1 | grep -oE '[0-9]+' | tail -1)
+PRIOR_BACKUP_ID=$(printf '%s' "${PRIOR_CM}" \
+  | grep -oE '\\"backup_id\\":[[:space:]]*\\"[^"\\]*' \
+  | head -1 | sed 's/.*\\"backup_id\\":[[:space:]]*\\"//')
+case "${PRIOR_EPOCH}" in ''|*[!0-9]*) PRIOR_EPOCH=0 ;; esac
+[ -z "${PRIOR_BACKUP_ID}" ] && PRIOR_BACKUP_ID="bootstrap"
+echo "[backup] step: prior_epoch=${PRIOR_EPOCH} prior_backup_id=${PRIOR_BACKUP_ID}"
 
 echo "[backup] step: reading DBSIZE"
 DBSIZE=$(valkey-cli -h "${VALKEY_HOST}" -p 6379 --no-auth-warning DBSIZE 2>/dev/null | tr -d '[:space:]')
@@ -233,19 +254,21 @@ cat > /tmp/status-body.md <<SEOF
 **Status: SUCCESS**
 - Timestamp: ${NOW_UTC}
 - Backup ID: ${BACKUP_ID}
-- Snapshot timestamp: epoch=${NEW_LASTSAVE}
+- Snapshot captured at: ${NOW_UTC} (epoch=${NEW_LASTSAVE})
 - Artifact bytes: ${SIZE}
+- Artifact sha256: ${RDB_SHA256}
 - Artifact location: configmap/${ARTIFACT_CM}/dump.rdb
-- Restore proof: key_count_at_snapshot=${DBSIZE}, magic=REDIS, lastsave_advanced=${PREV_LASTSAVE}->${NEW_LASTSAVE}
+- Restore proof: key_count_at_snapshot=${DBSIZE}, rdb_magic_ok=true, lastsave_advanced=${PREV_LASTSAVE}->${NEW_LASTSAVE}
+- Previous run: backup_id=${PRIOR_BACKUP_ID}, snapshot_epoch=${PRIOR_EPOCH}
 SEOF
 patch_cm "${STATUS_CM}" "status.md" "/tmp/status-body.md" || publish_failure "failed to publish status"
 
 cat > /tmp/handoff-body.json <<HEOF
-{"latest_run":"${NOW_UTC}","backup_id":"${BACKUP_ID}","result":"success","safe_for_restore":true,"snapshot_epoch":${NEW_LASTSAVE},"artifact_bytes":${SIZE},"artifact_location":{"type":"configmap","name":"${ARTIFACT_CM}","key":"dump.rdb","namespace":"${NS}"},"restore_proof":{"key_count_at_snapshot":${DBSIZE},"rdb_magic_ok":true,"lastsave_before":${PREV_LASTSAVE},"lastsave_after":${NEW_LASTSAVE}},"reason":"backup produced a fresh snapshot with verified magic bytes and non-zero key count"}
+{"latest_run":"${NOW_UTC}","backup_id":"${BACKUP_ID}","result":"success","safe_for_restore":true,"snapshot_epoch":${NEW_LASTSAVE},"artifact_bytes":${SIZE},"artifact_sha256":"${RDB_SHA256}","artifact_location":{"type":"configmap","name":"${ARTIFACT_CM}","key":"dump.rdb","namespace":"${NS}"},"restore_proof":{"key_count_at_snapshot":${DBSIZE},"rdb_magic_ok":true,"lastsave_before":${PREV_LASTSAVE},"lastsave_after":${NEW_LASTSAVE}},"previous_run":{"snapshot_epoch":${PRIOR_EPOCH},"backup_id":"${PRIOR_BACKUP_ID}"},"reason":"backup produced a fresh snapshot with verified magic bytes, sha256-checksummed, and non-zero key count"}
 HEOF
 patch_cm "${HANDOFF_CM}" "handoff.json" "/tmp/handoff-body.json" || publish_failure "failed to publish handoff"
 
-echo "[backup] ${BACKUP_ID}: SUCCESS (size=${SIZE}, keys=${DBSIZE}, lastsave ${PREV_LASTSAVE}->${NEW_LASTSAVE})"
+echo "[backup] ${BACKUP_ID}: SUCCESS (size=${SIZE}, sha=${RDB_SHA256:0:12}, keys=${DBSIZE}, lastsave ${PREV_LASTSAVE}->${NEW_LASTSAVE})"
 SCRIPT_EOF
 
 echo "[solution] Installing fixed script (active + approved baseline)..."

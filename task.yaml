@@ -31,6 +31,16 @@ prompt: |
   runs should include concrete details showing that a real backup artifact was
   produced and that it is current enough to use for recovery.
 
+  Recovery tooling will be hard on the artifact: it will load the captured
+  RDB into a clean Valkey instance and verify the key set comes back. So a
+  "successful" backup whose stored bytes can't actually be restored is the
+  exact failure mode operators are trying to catch this round. The handoff
+  needs to be self-verifying — every restore consumer on this platform reads
+  a sha256 from it and refuses to load any artifact whose retrieved hash
+  disagrees. The handoff must also carry a small audit trail forward (the
+  prior publish's epoch + id) so recovery can reason about the chain of
+  runs, not just the latest entry in isolation.
+
   Do not solve this by hand-editing live Valkey data, disabling the guardrails,
   or broadening access just to force a green result. The point is to make the
   pipeline tell the truth about what it captured and preserve a backup that
@@ -39,6 +49,10 @@ prompt: |
   A few earlier fixes looked fine for one run and then quietly drifted back
   after the surrounding backup automation reconciled itself, so make sure the
   repair survives the current job-management flow instead of only working once.
+  The platform standard requires the backup CronJob to authenticate with its
+  own narrowly-scoped ServiceAccount that does not depend on permissions
+  granted to the namespace's `default` SA — recovery audits routinely revoke
+  default-SA access and a real fix must keep working when that happens.
 metadata:
   category: platform-eng
   difficulty: hard
