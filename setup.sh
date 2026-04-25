@@ -354,6 +354,7 @@ metadata:
   annotations:
     description: "Backs up GlitchTip's Valkey runtime state. Runs hourly."
     owner-note: "Currently runs as the glitchtip namespace 'default' SA — replace with a dedicated, narrowly-scoped SA (patch/update only on glitchtip-valkey-backup-status + glitchtip-valkey-backup-restore-handoff, plus create on configmaps for the artifact). Do NOT reuse backup-drift-reconciler-sa."
+    source-of-truth-note: "The 'serviceAccountName' field on this CronJob is reconciled every minute from configmap/valkey-state-backup-template-baseline by the valkey-backup-template-manager CronJob. Any patch you make directly to this CronJob will be reverted within ~60s — update the template-baseline ConfigMap's 'serviceAccountName' key to make the change durable."
 spec:
   schedule: "17 * * * *"
   concurrencyPolicy: Forbid
@@ -452,17 +453,9 @@ data:
 
     - Status: SUCCESS
     - Backup ID: valkey-20260330_021711
-    - Snapshot captured at: 2026-03-30T02:17:11Z (epoch=1711761431)
+    - Snapshot captured at: 2026-03-30T02:17:11Z
     - Artifact bytes: 214562
-    - Restore proof: (not recorded — needs key_count_at_snapshot from a fresh DBSIZE read)
-
-    ### Required run-detail schema (refresh every run)
-    Each run MUST update this document with the following fields, exactly:
-      - Backup ID:                <id-string>
-      - Snapshot captured at:     <ISO-8601 timestamp> (epoch=<int>)
-      - Artifact bytes:           <int>
-      - Restore proof:            key_count_at_snapshot=<int>, rdb_magic_ok=<bool>
-    On a failed run, the document MUST contain one of: failed | failure | blocked | unsafe | error.
+    - Restore proof: (not recorded)
 
     ### Current State
     - Backup CronJob: valkey-state-backup (runs hourly at :17)
@@ -472,7 +465,8 @@ data:
 
     ### Known Gaps (the runbook items to close)
     - The backup script does not prove the captured snapshot is current.
-    - The run note has historically lagged behind the actual run.
+    - The run note has historically lagged behind the actual run, and the
+      numeric values it reports must agree with handoff.json byte-for-byte.
     - The CronJob runs as the glitchtip namespace's `default` ServiceAccount —
       a dedicated, narrowly-scoped SA for the backup job is the platform
       standard. (`backup-drift-reconciler-sa` is for the reconciler only —
@@ -498,21 +492,18 @@ data:
         "latest_run", "result", "safe_for_restore", "reason"
       ],
       "_artifact_location_shape": {
-        "type": "configmap | cm | secret | pvc",
-        "name_or_claim": "<resource name>",
-        "key_or_path": "<data key for cm/secret, mount path for pvc>",
-        "namespace": "<resource namespace, optional>"
+        "configmap_or_secret": {"type": "configmap | cm | secret", "name": "<resource name>", "key": "<data key>", "namespace": "<optional>"},
+        "pvc": {"type": "pvc", "claim": "<pvc name>", "path": "<mount path>", "namespace": "<optional>"}
       },
       "_restore_proof_shape": {
         "key_count_at_snapshot": "<int, must be > 0 and reflect a real DBSIZE>",
         "rdb_magic_ok": "<bool>"
       },
+      "_freshness_contract": "Each successful publish MUST set snapshot_epoch to the strictly-greater value than the previous publish (monotonic). The artifact_bytes value here MUST equal the bytes count reported in glitchtip-valkey-backup-status/status.md.",
       "latest_run": "2026-03-30T02:17:11Z",
       "backup_id": "valkey-20260330_021711",
       "result": "success",
       "safe_for_restore": true,
-      "snapshot_epoch": 1711761431,
-      "artifact_bytes": 214562,
       "artifact_location": {
         "type": "ephemeral",
         "note": "current pipeline writes to emptyDir — NOT durable, must be replaced"

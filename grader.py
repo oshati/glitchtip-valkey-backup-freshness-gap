@@ -267,6 +267,7 @@ def read_artifact_bytes(location):
     location is the dict parsed out of handoff.artifact_location:
       {"type": "configmap|secret", "name": "...", "key": "...", "namespace": "..."}
       {"type": "pvc", "claim": "...", "path": "..."}
+    Also accepts the legacy/aliased shape `name_or_claim`/`key_or_path`.
     Returns (bytes, error_message).
     """
     if not isinstance(location, dict):
@@ -275,8 +276,8 @@ def read_artifact_bytes(location):
     ns = location.get("namespace") or NAMESPACE
 
     if kind in ("configmap", "cm"):
-        name = location.get("name") or ""
-        key = location.get("key") or "dump.rdb"
+        name = location.get("name") or location.get("name_or_claim") or ""
+        key = location.get("key") or location.get("key_or_path") or "dump.rdb"
         if not name:
             return b"", "configmap artifact_location missing name"
         rc, out, _ = run_cmd(
@@ -300,8 +301,8 @@ def read_artifact_bytes(location):
             return b"", f"failed to decode binaryData: {e}"
 
     if kind in ("secret",):
-        name = location.get("name") or ""
-        key = location.get("key") or "dump.rdb"
+        name = location.get("name") or location.get("name_or_claim") or ""
+        key = location.get("key") or location.get("key_or_path") or "dump.rdb"
         rc, out, _ = run_cmd(
             f"kubectl get secret {name} -n {ns} "
             f"-o jsonpath='{{.data.{key.replace('.', chr(92)+chr(46))}}}' 2>/dev/null"
@@ -316,8 +317,8 @@ def read_artifact_bytes(location):
             return b"", f"failed to decode secret data: {e}"
 
     if kind == "pvc":
-        claim = location.get("claim") or ""
-        path = location.get("path") or ""
+        claim = location.get("claim") or location.get("name_or_claim") or ""
+        path = location.get("path") or location.get("key_or_path") or ""
         if not claim or not path:
             return b"", "pvc artifact_location missing claim or path"
         ts = int(time.time())
@@ -401,6 +402,15 @@ def check_backup_enforces_snapshot_freshness(setup_info):
             break
         time.sleep(2)
 
+    # Snapshot the previously-published snapshot_epoch so we can require
+    # strict monotonic advance after the clean run. Catches agents who
+    # publish a copy of the seeded baseline epoch without producing a
+    # genuinely fresh snapshot.
+    pre_handoff = parse_handoff(get_handoff_doc()) or {}
+    prior_snapshot_epoch = pre_handoff.get("snapshot_epoch")
+    if not isinstance(prior_snapshot_epoch, int):
+        prior_snapshot_epoch = 0
+
     lastsave_before = get_lastsave()
     run_start = int(time.time())
     ts = int(time.time())
@@ -426,6 +436,12 @@ def check_backup_enforces_snapshot_freshness(setup_info):
         return 0.0, (
             f"handoff.snapshot_epoch={snapshot_epoch} not >= run_start={run_start} "
             "(agent didn't force a fresh snapshot)"
+        )
+    if snapshot_epoch <= prior_snapshot_epoch:
+        return 0.0, (
+            f"handoff.snapshot_epoch={snapshot_epoch} did not strictly advance "
+            f"past prior published epoch={prior_snapshot_epoch} — backup is "
+            "republishing a stale value rather than capturing a fresh snapshot"
         )
     lastsave_after = get_lastsave()
     if lastsave_after <= lastsave_before:
@@ -611,6 +627,35 @@ def check_status_and_handoff_surface_truth(setup_info):
             return 0.0, f"handoff missing field '{key}' on success"
     if parsed.get("safe_for_restore") is not True:
         return 0.0, "handoff.safe_for_restore != true on clean run"
+
+    # Cross-doc consistency: status.md MUST report the same numeric values
+    # as handoff.json. Fill-in-the-blanks templates pass the regex above
+    # but lie about the numbers; require artifact_bytes (and snapshot
+    # epoch when status mentions one) to match handoff to within zero.
+    h_bytes = parsed.get("artifact_bytes")
+    if isinstance(h_bytes, int):
+        bytes_in_status = re.findall(
+            r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
+            status_lower,
+        )
+        if bytes_in_status:
+            int_vals = {int(v) for v in bytes_in_status}
+            if h_bytes not in int_vals:
+                return 0.0, (
+                    f"status.md reports artifact bytes {sorted(int_vals)} but "
+                    f"handoff.json reports {h_bytes} — the two surfaces do "
+                    "not agree, restore tooling cannot trust either"
+                )
+    h_epoch = parsed.get("snapshot_epoch")
+    if isinstance(h_epoch, int):
+        epoch_in_status = re.findall(r"epoch\s*[:=]\s*(\d+)", status_lower)
+        if epoch_in_status:
+            int_vals = {int(v) for v in epoch_in_status}
+            if h_epoch not in int_vals:
+                return 0.0, (
+                    f"status.md reports snapshot epoch {sorted(int_vals)} but "
+                    f"handoff.json reports {h_epoch} — surfaces disagree"
+                )
 
     # Forced-failure: scale Valkey to 0, run again, expect failure surface
     ts2 = int(time.time())
