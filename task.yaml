@@ -55,6 +55,17 @@ prompt: |
   must demonstrably postdate the snapshot taken during run N — recovery
   tooling treats a re-publish of the same snapshot as a stale run.
 
+  The captured artifact must be a point-in-time RDB taken at the
+  moment the master forks for BGSAVE — not a live re-serialization
+  of the keyspace at the moment the artifact bytes are read. Recovery
+  tooling distinguishes the two by inspecting the captured RDB for
+  writes that landed on master AFTER the fork started: a true
+  fork-frozen snapshot does not contain them; a live re-serialization
+  does. A common mistake is to issue BGSAVE, wait for LASTSAVE to
+  advance, then issue `valkey-cli --rdb` as a separate step — the
+  separate `--rdb` step triggers a fresh fork that includes any
+  writes that happened in the gap.
+
   Note on the runtime topology. The Valkey workload is not a single
   pod. It runs as a StatefulSet whose ordinal-0 member is the writable
   master and whose other members are read-only replicas that lag the

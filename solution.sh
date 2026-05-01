@@ -131,29 +131,35 @@ case "${MASTER_REPL_OFFSET}" in
 esac
 echo "[backup] step: master_replid=${MASTER_REPLID} offset=${MASTER_REPL_OFFSET}"
 
-echo "[backup] step: BGSAVE + LASTSAVE advance"
+echo "[backup] step: capture point-in-time RDB via single --rdb call"
+# `--rdb` issues SYNC to the master, which forks IMMEDIATELY and
+# streams the fork-frozen image atomically to the client. We do NOT
+# pre-call BGSAVE separately and wait for LASTSAVE to advance; that
+# pattern leaves a window between BGSAVE-complete and --rdb-issue
+# during which writes accumulate on master and the second --rdb
+# fork captures them. A single `--rdb` call queues onto the
+# in-flight fork-1 stream and returns the genuinely fork-frozen
+# bytes with no live-re-serialization gap.
 PREV_LASTSAVE=$(valkey-cli -h "${MASTER_HOST}" -p 6379 --no-auth-warning LASTSAVE 2>/dev/null | tr -d '[:space:]')
 [ -z "${PREV_LASTSAVE}" ] && PREV_LASTSAVE=0
-BGSAVE_OUT=$(valkey-cli -h "${MASTER_HOST}" -p 6379 --no-auth-warning BGSAVE 2>&1)
-BGSAVE_RC=$?
-if [ "${BGSAVE_RC}" != "0" ] && ! printf '%s' "${BGSAVE_OUT}" | grep -qi "in progress"; then
-  publish_failure "BGSAVE failed (rc=${BGSAVE_RC}): ${BGSAVE_OUT}"
-fi
+valkey-cli -h "${MASTER_HOST}" -p 6379 --no-auth-warning --rdb "${OUT}" >/tmp/rdb.log 2>&1
+RDB_RC=$?
+[ "${RDB_RC}" != "0" ] && publish_failure "valkey-cli --rdb failed (rc=${RDB_RC}): $(head -c 200 /tmp/rdb.log)"
+[ -f "${OUT}" ] || publish_failure "RDB file not written"
+
+# Confirm BGSAVE happened (LASTSAVE advanced as a side-effect of
+# --rdb's fork). Verifies the snapshot is genuinely new, not a
+# replay of an existing on-disk dump.
 NEW_LASTSAVE=${PREV_LASTSAVE}
 i=0
-while [ $i -lt 45 ]; do
+while [ $i -lt 30 ]; do
   CURR=$(valkey-cli -h "${MASTER_HOST}" -p 6379 --no-auth-warning LASTSAVE 2>/dev/null | tr -d '[:space:]')
   if [ -n "${CURR}" ] && [ "${CURR}" -gt "${PREV_LASTSAVE}" ] 2>/dev/null; then
     NEW_LASTSAVE=${CURR}; break
   fi
   sleep 1; i=$((i+1))
 done
-[ "${NEW_LASTSAVE}" = "${PREV_LASTSAVE}" ] && publish_failure "LASTSAVE did not advance"
-
-echo "[backup] step: --rdb fetch from master into ${OUT}"
-valkey-cli -h "${MASTER_HOST}" -p 6379 --no-auth-warning --rdb "${OUT}" >/tmp/rdb.log 2>&1
-[ $? -ne 0 ] && publish_failure "valkey-cli --rdb failed: $(head -c 200 /tmp/rdb.log)"
-[ -f "${OUT}" ] || publish_failure "RDB file not written"
+[ "${NEW_LASTSAVE}" = "${PREV_LASTSAVE}" ] && publish_failure "LASTSAVE did not advance after --rdb"
 MAGIC=$(head -c 5 "${OUT}" 2>/dev/null || true)
 SIZE=$(wc -c < "${OUT}" | tr -d '[:space:]')
 RDB_SHA256=$(sha256sum "${OUT}" 2>/dev/null | awk '{print $1}')

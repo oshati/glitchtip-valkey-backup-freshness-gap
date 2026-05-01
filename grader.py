@@ -858,10 +858,54 @@ def check_backup_enforces_snapshot_freshness(setup_info):
     rdb_marker_value = f"PROOF-{ts}-NONCE-{os.urandom(8).hex()}"
     marker_written = write_marker_key(rdb_marker_name, rdb_marker_value)
 
+    # Point-in-time detection: spawn a background thread that waits
+    # for either rdb_bgsave_in_progress=1 or LASTSAVE to advance, then
+    # writes a unique post-key onto master. A truly fork-frozen RDB
+    # captured at fork-time will NOT contain this post-key. A live
+    # re-serialize (e.g. sequential `BGSAVE; wait LASTSAVE; --rdb`,
+    # where `--rdb` triggers a SECOND fork after the post-key has
+    # landed on master) WILL contain it.
+    import threading as _thr
+    rdb_post_name = f"grader:post-bgsave:{ts}"
+    rdb_post_value = f"POST-{ts}-NONCE-{os.urandom(8).hex()}"
+    post_written_flag = [False]
+    post_stop_flag = [False]
+
+    def _post_key_thread():
+        deadline = time.time() + 90
+        while time.time() < deadline and not post_stop_flag[0]:
+            rc, info_out, _ = run_cmd(
+                f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- "
+                "valkey-cli INFO persistence 2>/dev/null", timeout=5,
+            )
+            in_progress = "rdb_bgsave_in_progress:1" in (info_out or "")
+            curr_last = 0
+            for ln in (info_out or "").splitlines():
+                if ln.startswith("rdb_last_save_time:"):
+                    try:
+                        curr_last = int(ln.split(":", 1)[1].strip())
+                    except ValueError:
+                        curr_last = 0
+                    break
+            if in_progress or curr_last > lastsave_before:
+                if write_marker_key(rdb_post_name, rdb_post_value):
+                    post_written_flag[0] = True
+                return
+            time.sleep(0.15)
+        # Fallback: deadline hit without observing BGSAVE — write
+        # anyway so the post-key check has a definite verdict.
+        if write_marker_key(rdb_post_name, rdb_post_value):
+            post_written_flag[0] = True
+
+    post_thread = _thr.Thread(target=_post_key_thread, daemon=True)
+    post_thread.start()
+
     job = f"grader-fresh-{ts}"
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     handoff = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
+    post_stop_flag[0] = True
+    post_thread.join(timeout=5)
 
     score = 0.0
     notes = []
@@ -984,7 +1028,28 @@ def check_backup_enforces_snapshot_freshness(setup_info):
         score += 0.25
     notes.append(f"B:{component_b_reason}")
 
-    # ── Component C: captured RDB contains the freshness marker key ──
+    # ── Component C: point-in-time RDB ──
+    # The captured RDB MUST contain the pre-key freshness marker
+    # (proves the snapshot covers state up to the moment of trigger)
+    # AND MUST NOT contain the post-BGSAVE-start key (proves the
+    # snapshot is fork-frozen at BGSAVE-fork time, not a live
+    # re-serialization at fetch time).
+    #
+    # The post-key was written by the background thread once it
+    # observed `rdb_bgsave_in_progress=1` (or LASTSAVE advance) on
+    # master. So by the time master's BGSAVE forks, post-key is NOT
+    # yet on master; by the time master's BGSAVE completes,
+    # post-key IS on master. Any agent that:
+    #   - issues `valkey-cli --rdb` AFTER waiting for LASTSAVE to
+    #     advance triggers a SECOND fork in the server, and that
+    #     fork captures the live keyspace including the post-key →
+    #     FAIL.
+    #   - reads /data/dump.rdb byte-for-byte (the fork-frozen file)
+    #     captures only state at fork-1 time → PASS.
+    #   - issues a single `--rdb` call (no separate BGSAVE wait)
+    #     atomically queues onto the in-flight fork-1 stream →
+    #     PASS, because the post-key write only happens AFTER the
+    #     fork has already started.
     component_c_ok = False
     component_c_reason = "skipped (no artifact_location to read)"
     if not marker_written:
@@ -1006,9 +1071,30 @@ def check_backup_enforces_snapshot_freshness(setup_info):
                 component_c_reason = (
                     f"freshness marker '{rdb_marker_name}' not in captured RDB"
                 )
+            elif not post_written_flag[0]:
+                # Grader could not deterministically write the
+                # post-key (rare — Valkey unreachable). Pass on the
+                # pre-key alone in that degenerate case.
+                component_c_ok = True
+                component_c_reason = (
+                    "marker present in RDB (post-key check skipped: "
+                    "grader could not write post-key)"
+                )
+            elif rdb_contains_marker(
+                rdb_bytes, rdb_post_name, rdb_post_value
+            ):
+                component_c_reason = (
+                    f"point-in-time violation: post-BGSAVE-start key "
+                    f"'{rdb_post_name}' IS in captured RDB — snapshot "
+                    "was a live re-serialization at fetch time, not "
+                    "fork-frozen at BGSAVE-fork time"
+                )
             else:
                 component_c_ok = True
-                component_c_reason = "marker present in RDB"
+                component_c_reason = (
+                    "marker present in RDB; post-key absent "
+                    "(point-in-time fork-frozen)"
+                )
     if component_c_ok:
         score += 0.25
         notes.append(f"C:{component_c_reason}")
