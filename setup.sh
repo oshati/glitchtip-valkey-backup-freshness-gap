@@ -233,6 +233,64 @@ spec:
       resources:
         requests:
           storage: 256Mi
+---
+# Platform durable-archive PVC. Pre-provisioned with a known name so
+# backup workloads can route oversized artifacts here. The namespace
+# ResourceQuota does NOT budget additional PVCs for backup workloads.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glitchtip-valkey-backup-archive
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup-archive
+  annotations:
+    description: "Durable archive PVC for Valkey backup artifacts. RWO local-path."
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 256Mi
+---
+# Platform-managed quota: caps ConfigMap count (so wildcards don't
+# drive away storage) and PVC count to the budgeted slots — Valkey's
+# StatefulSet PVCs + the archive PVC + a small slack for grader probes.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: glitchtip-platform-quota
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: platform-policy
+spec:
+  hard:
+    count/configmaps: "32"
+    count/secrets: "20"
+    count/persistentvolumeclaims: "5"
+---
+# Trust anchor for handoff signing keys. Recovery tooling reads
+# `data.public_key_fingerprints` (newline-separated 64-hex SHA-256
+# fingerprints of Ed25519 raw public keys) to establish which keys
+# may sign a successful handoff record. Backup pipelines must
+# register their per-run public key fingerprint here, and must rotate
+# the key between consecutive runs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glitchtip-valkey-backup-trust-anchor
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup-trust-anchor
+data:
+  public_key_fingerprints: ""
+  README: |
+    Each line under public_key_fingerprints is the SHA-256 hex digest
+    of an Ed25519 raw public key (32 bytes) trusted to sign a handoff
+    success record. Keys must rotate between consecutive runs.
 EOF
 
 echo "[setup] Waiting for Valkey StatefulSet (2 replicas: 1 master + 1 read-only)..."

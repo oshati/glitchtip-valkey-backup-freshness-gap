@@ -410,6 +410,88 @@ def resolve_sha256(parsed):
     return None
 
 
+TRUST_ANCHOR_CM = "glitchtip-valkey-backup-trust-anchor"
+
+
+def _canonical_handoff_payload(parsed):
+    """
+    Build the canonical bytes that the handoff signature MUST cover.
+    Documented in task.yaml: a sorted-key JSON object containing
+    backup_id, snapshot_epoch, artifact_sha256, artifact_source_pod,
+    artifact_source_role. No spaces, sort_keys=True. Recovery tooling
+    constructs this payload identically.
+    """
+    payload = {
+        "backup_id": parsed.get("backup_id"),
+        "snapshot_epoch": parsed.get("snapshot_epoch"),
+        "artifact_sha256": parsed.get("artifact_sha256"),
+        "artifact_source_pod": parsed.get("artifact_source_pod"),
+        "artifact_source_role": parsed.get("artifact_source_role"),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _verify_handoff_signature(parsed):
+    """
+    Verify Ed25519 signature on the canonical handoff payload, and
+    confirm the public key fingerprint is registered in the trust
+    anchor ConfigMap.
+
+    Returns (ok, reason, fingerprint_hex_or_None).
+    """
+    import base64 as _b64
+    import hashlib as _h
+    sig_block = parsed.get("signature") if isinstance(parsed, dict) else None
+    if not isinstance(sig_block, dict):
+        return False, "no signature block in handoff", None
+    if sig_block.get("alg") != "ed25519":
+        return False, f"signature.alg={sig_block.get('alg')!r} (must be 'ed25519')", None
+    pk_b64 = sig_block.get("public_key")
+    sig_b64 = sig_block.get("sig")
+    if not isinstance(pk_b64, str) or not isinstance(sig_b64, str):
+        return False, "signature.public_key / signature.sig must be base64 strings", None
+    try:
+        pk = _b64.b64decode(pk_b64)
+        sig = _b64.b64decode(sig_b64)
+    except Exception as e:
+        return False, f"signature base64 decode failed: {e}", None
+    if len(pk) != 32:
+        return False, f"public_key is {len(pk)}B (must be raw 32-byte Ed25519 key)", None
+    if len(sig) != 64:
+        return False, f"sig is {len(sig)}B (must be raw 64-byte Ed25519 signature)", None
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        return False, "cryptography lib not available in grader env", None
+    try:
+        Ed25519PublicKey.from_public_bytes(pk).verify(
+            sig, _canonical_handoff_payload(parsed)
+        )
+    except InvalidSignature:
+        return False, "Ed25519 signature does NOT verify against canonical payload", None
+    except Exception as e:
+        return False, f"signature verification error: {e}", None
+    fingerprint = _h.sha256(pk).hexdigest()
+    rc, fps_data, _ = run_cmd(
+        f"kubectl get configmap {TRUST_ANCHOR_CM} -n {NAMESPACE} "
+        f"-o jsonpath='{{.data.public_key_fingerprints}}' 2>/dev/null",
+        timeout=10,
+    )
+    if rc != 0:
+        return False, f"could not read trust-anchor CM {TRUST_ANCHOR_CM}", None
+    registered = {ln.strip().lower() for ln in (fps_data or "").splitlines() if ln.strip()}
+    if fingerprint not in registered:
+        return False, (
+            f"public key fingerprint {fingerprint[:16]}.. NOT registered in "
+            f"{TRUST_ANCHOR_CM}.public_key_fingerprints "
+            f"(registered: {len(registered)} keys)"
+        ), fingerprint
+    return True, "verified + registered", fingerprint
+
+
 def verify_artifact_source_role(parsed):
     """
     Verify that the handoff declares the backup ran against the Valkey
@@ -1242,9 +1324,20 @@ def check_status_and_handoff_surface_truth(setup_info):
             f"handoff_parseable={parsed is not None})"
         )
 
-    # ── Component B: handoff has core success shape ──
+    # ── Component B: Ed25519 signature verifies + key rotation ──
+    # Replaces the old plain-sha256 check. Handoff's `signature` block
+    # must:
+    #   * declare alg="ed25519" with raw 32-byte public_key (b64) and
+    #     raw 64-byte sig (b64)
+    #   * verify against canonical JSON of the success record
+    #   * sha256(public_key) must appear in the trust-anchor ConfigMap
+    #   * a SECOND run's public_key fingerprint must be DIFFERENT from
+    #     the first run's (key rotation between consecutive backups)
+    # Reuses the plain-bytes sha256 sanity check as a fallback fail
+    # state. This is the strongest authenticity signal in the grader.
     component_b_ok = False
     component_b_reason = "handoff not parseable"
+    run1_fingerprint = None
     if parsed is not None:
         backup_id = parsed.get("backup_id")
         snap_epoch = resolve_snapshot_epoch(parsed)
@@ -1260,85 +1353,145 @@ def check_status_and_handoff_surface_truth(setup_info):
             missing.append("safe_for_restore")
         if not isinstance(location, dict):
             missing.append("artifact_location")
+        sig_block = parsed.get("signature")
+        if not isinstance(sig_block, dict):
+            missing.append("signature")
         if missing:
             component_b_reason = f"handoff missing fields {missing}"
         elif parsed.get("safe_for_restore") != True:
             component_b_reason = "handoff.safe_for_restore != true on clean run"
-        elif not isinstance(parsed.get("artifact_bytes"), int):
-            component_b_reason = "handoff.artifact_bytes must be an int"
         else:
-            # SHA256 integrity check (artifact bytes must match published hash).
-            import hashlib as _h
-            handoff_sha = resolve_sha256(parsed)
-            if not isinstance(handoff_sha, str) or len(handoff_sha) != 64:
-                component_b_reason = (
-                    "no recognised sha256 field on handoff (expected "
-                    "artifact_sha256, sha256, or rdb_sha256)"
-                )
+            ok, reason, fp = _verify_handoff_signature(parsed)
+            if not ok:
+                component_b_reason = f"signature: {reason}"
             else:
+                # Sanity-check sha256 still matches actual artifact bytes
+                # (so signature can't lie about hash either).
+                import hashlib as _h
+                handoff_sha = resolve_sha256(parsed)
                 art_bytes, art_err = read_artifact_bytes(location)
                 if art_err:
                     component_b_reason = f"could not retrieve artifact: {art_err}"
+                elif _h.sha256(art_bytes).hexdigest() != (handoff_sha or "").lower():
+                    component_b_reason = (
+                        f"artifact_sha256 mismatch: handoff={handoff_sha[:16] if handoff_sha else 'none'}.., "
+                        f"actual={_h.sha256(art_bytes).hexdigest()[:16]}.."
+                    )
                 else:
-                    actual_sha = _h.sha256(art_bytes).hexdigest()
-                    if handoff_sha.lower() != actual_sha:
+                    run1_fingerprint = fp
+                    # Trigger a SECOND run and require a DIFFERENT
+                    # signing key fingerprint — proves rotation.
+                    time.sleep(3)
+                    ts_b2 = int(time.time())
+                    marker_b2 = f"GRADER-SURF-B2-{ts_b2}"
+                    set_status_marker(marker_b2)
+                    set_handoff_marker(marker_b2)
+                    job_b2 = f"grader-surf-b2-{ts_b2}"
+                    completed_b2, _, _ = trigger_backup(job_b2, wait_seconds=240)
+                    handoff_b2 = wait_for_doc_change(get_handoff_doc, marker_b2)
+                    cleanup_job(job_b2)
+                    parsed_b2 = parse_handoff(handoff_b2)
+                    if not completed_b2 or parsed_b2 is None:
                         component_b_reason = (
-                            f"artifact_sha256 mismatch: handoff={handoff_sha[:16]}.., "
-                            f"actual={actual_sha[:16]}.."
+                            "second run for rotation check did not complete"
                         )
                     else:
-                        component_b_ok = True
-                        component_b_reason = "handoff success-shape OK"
+                        ok2, reason2, fp2 = _verify_handoff_signature(parsed_b2)
+                        if not ok2:
+                            component_b_reason = (
+                                f"run 2 signature: {reason2}"
+                            )
+                        elif fp2 == run1_fingerprint:
+                            component_b_reason = (
+                                f"signing key NOT rotated between runs: "
+                                f"both fingerprint={fp[:16]}.. "
+                                "(must rotate per run)"
+                            )
+                        else:
+                            component_b_ok = True
+                            component_b_reason = (
+                                f"signature ok + rotated "
+                                f"({run1_fingerprint[:12]}.. -> "
+                                f"{fp2[:12]}..)"
+                            )
     if component_b_ok:
         score += 0.25
-        notes.append("B:success-shape-ok")
+        notes.append(f"B:{component_b_reason}")
     else:
         notes.append(f"B:{component_b_reason}")
 
-    # ── Component C: status numerics agree with handoff ──
+    # ── Component C: master replication identity attestation ──
+    # Replaces the old "status numerics agree" cosmetic check with a
+    # consistency probe. Handoff must declare:
+    #   - master_replid: the master's 40-hex replication ID from
+    #     `INFO replication`. Stable across replication; rotates on
+    #     failover. Lets recovery tooling detect "different master
+    #     produced this artifact".
+    #   - master_repl_offset: integer current replication offset at
+    #     capture time. Strictly increases under writes; lets recovery
+    #     tooling detect re-published static snapshots.
+    # Grader queries live master INFO replication and confirms:
+    #   * declared master_replid == live master_replid (no failover
+    #     masquerade), 40-hex
+    #   * declared master_repl_offset is a non-negative int and is
+    #     <= live offset + 1024 (within reasonable drift since capture
+    #     plus tolerance for ongoing writes by traffic-gen)
     component_c_ok = False
     component_c_reason = "skipped (handoff not parseable)"
-    if parsed is not None and status_doc:
-        status_lower = status_doc.lower()
-        h_bytes = parsed.get("artifact_bytes") if isinstance(
-            parsed.get("artifact_bytes"), int) else None
-        h_epoch = resolve_snapshot_epoch(parsed)
-        bytes_in_status = re.findall(
-            r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
-            status_lower,
-        )
-        # Accept any separator after "epoch" — colon, equals, whitespace,
-        # parens, brackets — and require at least 9 digits so we don't
-        # match incidental small numbers in unrelated text.
-        epoch_in_status = re.findall(
-            r"epoch[\s:=()\[\]]*(\d{9,})", status_lower
-        )
-        if h_bytes is None or h_epoch is None:
-            component_c_reason = "handoff lacks integer bytes/epoch to compare"
-        elif not bytes_in_status:
+    if parsed is not None:
+        h_replid = parsed.get("master_replid")
+        h_repl_off = parsed.get("master_repl_offset")
+        if not isinstance(h_replid, str) or not re.fullmatch(r"[0-9a-f]{40}", h_replid or ""):
             component_c_reason = (
-                "status.md missing numeric artifact-bytes value"
+                f"handoff.master_replid missing or not 40-hex "
+                f"(got {h_replid!r})"
             )
-        elif h_bytes not in {int(v) for v in bytes_in_status}:
+        elif not isinstance(h_repl_off, int) or h_repl_off < 0:
             component_c_reason = (
-                f"status.md bytes={sorted({int(v) for v in bytes_in_status})}, "
-                f"handoff={h_bytes} — disagree"
-            )
-        elif not epoch_in_status:
-            component_c_reason = (
-                "status.md missing numeric snapshot epoch"
-            )
-        elif h_epoch not in {int(v) for v in epoch_in_status}:
-            component_c_reason = (
-                f"status.md epoch={sorted({int(v) for v in epoch_in_status})}, "
-                f"handoff={h_epoch} — disagree"
+                f"handoff.master_repl_offset not a non-negative int "
+                f"(got {h_repl_off!r})"
             )
         else:
-            component_c_ok = True
-            component_c_reason = "numerics agree"
+            rc, info_out, _ = run_cmd(
+                f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- "
+                "valkey-cli INFO replication 2>/dev/null", timeout=15)
+            live_replid = ""
+            live_offset = -1
+            for ln in (info_out or "").splitlines():
+                ln = ln.strip()
+                if ln.startswith("master_replid:"):
+                    live_replid = ln.split(":", 1)[1].strip()
+                elif ln.startswith("master_repl_offset:"):
+                    try:
+                        live_offset = int(ln.split(":", 1)[1].strip())
+                    except ValueError:
+                        live_offset = -1
+            if rc != 0 or not live_replid:
+                component_c_reason = (
+                    "could not query live master_replid / offset for cross-check"
+                )
+            elif live_replid.lower() != h_replid.lower():
+                component_c_reason = (
+                    f"master_replid mismatch: handoff={h_replid[:12]}.., "
+                    f"live={live_replid[:12]}.. — backup did not capture "
+                    "from the current master generation"
+                )
+            elif live_offset < 0:
+                component_c_reason = "could not parse live master_repl_offset"
+            elif h_repl_off > live_offset + 1024:
+                component_c_reason = (
+                    f"master_repl_offset implausible: handoff={h_repl_off} > "
+                    f"live={live_offset} + 1024 tolerance"
+                )
+            else:
+                component_c_ok = True
+                component_c_reason = (
+                    f"replication identity ok "
+                    f"(replid={h_replid[:12]}.., offset={h_repl_off}/{live_offset})"
+                )
     if component_c_ok:
         score += 0.25
-        notes.append("C:numerics-agree")
+        notes.append(f"C:{component_c_reason}")
     else:
         notes.append(f"C:{component_c_reason}")
 
@@ -1496,10 +1649,64 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
                 f"backup SA '{sa}' can't patch the status or handoff ConfigMap"
             )
         else:
-            component_a_ok = True
-            component_a_reason = (
-                f"dedicated SA '{sa}' authorised for status+handoff"
+            # PSS Restricted compliance check on the backup CronJob's
+            # pod-template securityContext. The contract (per task.yaml)
+            # requires backup workloads to run with the Pod Security
+            # Standards "restricted" profile: runAsNonRoot=true,
+            # allowPrivilegeEscalation=false, readOnlyRootFilesystem=true,
+            # capabilities.drop includes "ALL", seccompProfile.type ∈
+            # {RuntimeDefault, Localhost}. The check inspects the
+            # CronJob's jobTemplate.spec.template.spec — agent-set
+            # values, post-patch — and fails Component A if any
+            # required item is missing.
+            cj = kget_json("cronjob", ns=NAMESPACE, name=BACKUP_CRONJOB) or {}
+            pod_spec = (
+                cj.get("spec", {})
+                  .get("jobTemplate", {})
+                  .get("spec", {})
+                  .get("template", {})
+                  .get("spec", {})
             )
+            pod_sc = pod_spec.get("securityContext") or {}
+            backup_container = next(
+                (c for c in (pod_spec.get("containers") or [])
+                 if c.get("name") == "backup"),
+                {},
+            )
+            ctr_sc = backup_container.get("securityContext") or {}
+            def _eff(k):
+                v = ctr_sc.get(k)
+                return v if v is not None else pod_sc.get(k)
+            pss_violations = []
+            if _eff("runAsNonRoot") is not True:
+                pss_violations.append("runAsNonRoot!=true")
+            if _eff("allowPrivilegeEscalation") is not False:
+                pss_violations.append("allowPrivilegeEscalation!=false")
+            if _eff("readOnlyRootFilesystem") is not True:
+                pss_violations.append("readOnlyRootFilesystem!=true")
+            caps = (ctr_sc.get("capabilities") or {})
+            drop = caps.get("drop") or []
+            if "ALL" not in drop and "all" not in drop:
+                pss_violations.append("capabilities.drop missing ALL")
+            sp = (
+                _eff("seccompProfile")
+                if isinstance(_eff("seccompProfile"), dict)
+                else {}
+            )
+            if sp.get("type") not in ("RuntimeDefault", "Localhost"):
+                pss_violations.append(
+                    f"seccompProfile.type={sp.get('type')!r} (need RuntimeDefault/Localhost)"
+                )
+            if pss_violations:
+                component_a_reason = (
+                    f"dedicated SA '{sa}' OK but backup CronJob pod spec "
+                    f"violates PSS Restricted: {pss_violations}"
+                )
+            else:
+                component_a_ok = True
+                component_a_reason = (
+                    f"dedicated SA '{sa}' + PSS Restricted compliant"
+                )
 
         # ── Component B: RBAC scoped (no wildcard CM patch, no CronJob
         # patch, no secret write, no configmap delete, resourceNames

@@ -102,17 +102,64 @@ prompt: |
         {"type":"configmap","name":<cm-name>,"key":<data-key>}
         {"type":"secret","name":<secret-name>,"key":<data-key>}
         {"type":"pvc","claim":<pvc-name>,"path":<absolute-path>}
+      A pre-provisioned archive PVC is available in the namespace for
+      backups that prefer the durable PVC route; the namespace
+      ResourceQuota does not budget additional PVCs for backup
+      workloads.
     - artifact_source_pod: name of the StatefulSet pod the snapshot
       was captured from (e.g. valkey-runtime-state-0)
     - artifact_source_role: the role that pod presented at capture
       time. Must be the string "master" — replicas are not a valid
       backup source
+    - master_replid: the 40-hex replication ID of the master pod at
+      capture time, as reported by `INFO replication`. Recovery
+      tooling uses this to detect failover masquerade — a snapshot
+      attributed to one master generation that actually came from
+      another is rejected.
+    - master_repl_offset: the integer master_repl_offset of the
+      master at capture time. Recovery tooling uses this together
+      with snapshot_epoch to detect re-published stale snapshots.
+    - signature: object proving authenticity of the success record.
+      Required fields:
+        alg: the string "ed25519"
+        public_key: the raw 32-byte Ed25519 public key, base64-
+          encoded (no PEM wrapper)
+        sig: the raw 64-byte Ed25519 signature, base64-encoded
+      The signature MUST cover the canonical JSON payload formed by
+      sorting keys lexicographically and using compact separators
+      ((",", ":")) on this exact field set, in this order:
+        backup_id, snapshot_epoch, artifact_sha256,
+        artifact_source_pod, artifact_source_role
+      Before each successful publish, the SHA-256 hex digest of the
+      raw 32-byte public_key MUST be appended (newline-separated) to
+      `data.public_key_fingerprints` of the trust-anchor ConfigMap
+      `glitchtip-valkey-backup-trust-anchor` so recovery tooling can
+      trust the key. Signing keys MUST rotate between consecutive
+      runs (a new keypair per run); a re-used fingerprint is
+      treated as a non-rotated forgery attempt.
+    - signed_at_epoch: integer Unix epoch at which the signature was
+      produced.
     - restore_proof: object including at minimum
       key_count_at_snapshot as an integer
   A failed run publishes safe_for_restore: false and a non-empty
   reason string explaining why restore is unsafe. No other field
   names are accepted in lieu of the above; recovery tooling will not
   resolve aliases.
+
+  Backup runtime PSS profile. Backup workloads must run with the Pod
+  Security Standards "restricted" profile. The CronJob's
+  jobTemplate.spec.template.spec must set, on the backup container
+  (or inherited from pod-level), all of:
+    - runAsNonRoot: true
+    - allowPrivilegeEscalation: false
+    - readOnlyRootFilesystem: true
+    - capabilities.drop including "ALL"
+    - seccompProfile.type ∈ {RuntimeDefault, Localhost}
+  The container image's writable working directories (e.g. /tmp,
+  /backups) must be backed by emptyDir or persistent volume mounts —
+  with readOnlyRootFilesystem: true, the container's root layer is
+  not writable. Pipelines that ignore this fail the security
+  posture audit even if the backup itself succeeds.
 
   Status note format. The human-readable status note is also scanned
   by lightweight tooling, so the snapshot's numeric Unix epoch and the
