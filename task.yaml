@@ -51,7 +51,20 @@ prompt: |
   on-disk snapshot timestamp; getting a genuinely new snapshot requires
   explicitly asking Valkey to take one and waiting for it to land. Any
   freshness claim the backup makes has to be backed by a snapshot that
-  really happened during the run.
+  really happened during the run, and a snapshot taken during run N+1
+  must demonstrably postdate the snapshot taken during run N — recovery
+  tooling treats a re-publish of the same snapshot as a stale run.
+
+  Note on the runtime topology. The Valkey workload is not a single
+  pod. It runs as a StatefulSet whose ordinal-0 member is the writable
+  master and whose other members are read-only replicas that lag the
+  master by an unbounded amount during normal operation. Backups must
+  capture from the writable master; an artifact captured from a replica
+  may be missing whatever has not yet replicated, even if its on-disk
+  snapshot file looks recent. The handoff record is expected to commit
+  to which pod produced the artifact and what role that pod was
+  presenting at capture time, so recovery tooling can verify the
+  source independently.
 
   Do not solve this by hand-editing live Valkey data, disabling the
   guardrails, or broadening access just to force a green result. The
@@ -72,22 +85,34 @@ prompt: |
   artifact bytes (sha256), published in the same handoff record that
   declares the artifact location.
 
-  Handoff record contract. The machine-readable handoff is JSON consumed
-  by recovery tooling and must use these field names so the consumer
-  doesn't have to guess. A successful run publishes:
+  Handoff record contract. The machine-readable handoff is JSON
+  consumed by recovery tooling. Recovery tooling does not guess at
+  field names — it reads exactly the names below. A successful run
+  publishes:
     - safe_for_restore: true (boolean)
     - backup_id: string identifier for the run
-    - snapshot_epoch: integer Unix epoch of the Valkey snapshot
-      (LASTSAVE after the run)
+    - snapshot_epoch: integer Unix epoch of the Valkey snapshot that
+      backed this run, strictly greater than the snapshot_epoch of any
+      prior successful run (a re-publish of an older snapshot counts
+      as a stale run, not a fresh one)
     - artifact_bytes: integer size of the captured RDB
     - artifact_sha256: 64-hex content hash of the artifact bytes
     - artifact_location: object identifying a durable in-cluster
-      resource (e.g. {"type":"configmap","name":...,"key":...} or
-      {"type":"secret",...} or {"type":"pvc","claim":...,"path":...})
+      resource. Exactly one of:
+        {"type":"configmap","name":<cm-name>,"key":<data-key>}
+        {"type":"secret","name":<secret-name>,"key":<data-key>}
+        {"type":"pvc","claim":<pvc-name>,"path":<absolute-path>}
+    - artifact_source_pod: name of the StatefulSet pod the snapshot
+      was captured from (e.g. valkey-runtime-state-0)
+    - artifact_source_role: the role that pod presented at capture
+      time. Must be the string "master" — replicas are not a valid
+      backup source
     - restore_proof: object including at minimum
       key_count_at_snapshot as an integer
   A failed run publishes safe_for_restore: false and a non-empty
-  reason string explaining why restore is unsafe.
+  reason string explaining why restore is unsafe. No other field
+  names are accepted in lieu of the above; recovery tooling will not
+  resolve aliases.
 
   Status note format. The human-readable status note is also scanned
   by lightweight tooling, so the snapshot's numeric Unix epoch and the

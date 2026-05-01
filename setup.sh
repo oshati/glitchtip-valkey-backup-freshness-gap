@@ -99,10 +99,8 @@ metadata:
 data:
   valkey.conf: |
     # Runtime cache for GlitchTip coordination state.
-    # Save policy: one write every hour OR 100k writes per 15 minutes.
-    # During normal platform operation snapshots are rare, so the on-disk
-    # RDB is expected to lag behind live state unless a backup actively
-    # forces a fresh snapshot.
+    # Master save policy: one write every hour OR 100k writes per 15
+    # minutes — snapshots are rare unless a backup forces them.
     save 3600 1
     save 900 100000
     appendonly no
@@ -112,6 +110,32 @@ data:
     protected-mode no
     maxmemory 64mb
     maxmemory-policy allkeys-lru
+    # Replication topology: this StatefulSet runs 3 pods. Pod ord=0 is
+    # the writable master; ord>=1 are read-only replicas configured via
+    # the entrypoint (see startup.sh). Replicas have an aggressive
+    # local snapshot policy so their on-disk RDB looks recent — but
+    # the keyset they hold lags the master for any unreplicated writes.
+    replica-priority 0
+    replica-read-only yes
+    repl-diskless-sync yes
+    repl-diskless-sync-delay 0
+  startup.sh: |
+    #!/bin/sh
+    # Pod ordinal is the trailing integer of the hostname.
+    ORD="${HOSTNAME##*-}"
+    MASTER_HOST="valkey-runtime-state-0.valkey-runtime-state.glitchtip.svc.cluster.local"
+    if [ "${ORD}" = "0" ]; then
+      echo "[startup] role=master (ord=0)"
+      exec valkey-server /config/valkey.conf
+    fi
+    echo "[startup] role=replica (ord=${ORD}) replicaof ${MASTER_HOST}:6379"
+    # Replicas snapshot every 60s with a single write so their on-disk
+    # dump.rdb mtime is recent — a naive backup that captures from a
+    # replica will look fresh but is missing whatever has not yet
+    # replicated from master at the moment of capture.
+    exec valkey-server /config/valkey.conf \
+      --replicaof "${MASTER_HOST}" 6379 \
+      --save "60 1"
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -123,7 +147,8 @@ metadata:
     component: cache
 spec:
   serviceName: valkey-runtime-state
-  replicas: 1
+  replicas: 3
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       app: valkey-runtime-state
@@ -137,8 +162,7 @@ spec:
       - name: valkey
         image: docker.io/valkey/valkey:7.2-alpine
         imagePullPolicy: IfNotPresent
-        args:
-        - /config/valkey.conf
+        command: ["/bin/sh", "/config/startup.sh"]
         ports:
         - containerPort: 6379
           name: resp
@@ -160,6 +184,7 @@ spec:
       - name: config
         configMap:
           name: valkey-runtime-state-config
+          defaultMode: 0755
   volumeClaimTemplates:
   - metadata:
       name: data
@@ -171,29 +196,30 @@ spec:
           storage: 256Mi
 EOF
 
-echo "[setup] Waiting for Valkey (k3s may be under load after scale-down)..."
+echo "[setup] Waiting for Valkey StatefulSet (3 replicas: 1 master + 2 read-only)..."
 # local-path-provisioner can take a moment after the heavy scale-down.
 # Make sure it is actually running before we wait on the pod.
 kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout=60s 2>/dev/null || \
   kubectl scale deployment local-path-provisioner -n kube-system --replicas=1 2>/dev/null || true
 
-for i in $(seq 1 90); do
+for i in $(seq 1 120); do
   READY=$(kubectl get statefulset/valkey-runtime-state -n glitchtip \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-  if [ "${READY}" = "1" ]; then
-    echo "[setup] Valkey ready after $((i*5))s."
+  if [ "${READY}" = "3" ]; then
+    echo "[setup] Valkey ready (3/3) after $((i*5))s."
     break
   fi
   if [ $((i % 6)) = 0 ]; then
-    echo "[setup] Valkey not ready yet (t=$((i*5))s). Pod / PVC status:"
+    echo "[setup] Valkey not ready yet (t=$((i*5))s, ready=${READY:-0}/3). Pod / PVC status:"
     kubectl get pod -n glitchtip -l app=valkey-runtime-state 2>&1 | head -5 || true
     kubectl get pvc -n glitchtip 2>&1 | head -5 || true
     kubectl get events -n glitchtip --sort-by='.lastTimestamp' 2>&1 | tail -10 || true
   fi
   sleep 5
 done
-kubectl wait --for=condition=ready pod -l app=valkey-runtime-state -n glitchtip --timeout=120s || true
+kubectl wait --for=condition=ready pod -l app=valkey-runtime-state -n glitchtip --timeout=180s || true
 
+# All writes go to ord=0 (master); replicas (-1, -2) PSYNC for reads.
 VALKEY_POD="valkey-runtime-state-0"
 
 ###############################################
@@ -247,6 +273,61 @@ STALE_STAMP=$(date -u -d "@$(( $(date -u +%s) - 7*24*3600 ))" '+%Y%m%d%H%M.%S')
 kubectl exec -n glitchtip "${VALKEY_POD}" -- touch -t "${STALE_STAMP}" /data/dump.rdb
 STALE_MTIME=$(kubectl exec -n glitchtip "${VALKEY_POD}" -- stat -c '%Y' /data/dump.rdb)
 echo "[setup] On-disk dump.rdb backdated to epoch ${STALE_MTIME} (stale by design)."
+
+###############################################
+# LIVE TRAFFIC GENERATOR
+# — emits short-TTL coordination keys every 30s. Two effects:
+#   (1) live DBSIZE drifts every minute, so a backup whose RDB was
+#       captured a few minutes ago will not match the live keyspace
+#       at restore-probe time (forces fresh BGSAVE on every run).
+#   (2) writes interleave with BGSAVE, so a naive backup that doesn't
+#       quiesce writes risks torn snapshots.
+###############################################
+echo "[setup] Installing live traffic generator CronJob..."
+
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: valkey-runtime-traffic
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: traffic-generator
+  annotations:
+    description: "Simulates live coordination traffic against Valkey"
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 50
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: writer
+            image: docker.io/valkey/valkey:7.2-alpine
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              VK="valkey-cli -h valkey-runtime-state.glitchtip.svc.cluster.local -p 6379 --no-auth-warning"
+              TS=$(date -u +%s)
+              # Short-horizon coordination state — TTL between 60s and 300s.
+              # Enough churn that a stale backup is detectable, but the
+              # base keyset (mute:/throttle:/coord:/stats:/...) persists.
+              for i in 1 2 3; do
+                $VK SET "throttle:tg-$$-${i}-${TS}" "${RANDOM}" EX 240 >/dev/null
+                $VK SET "coord:tg-$$-${i}-${TS}" "lock-${RANDOM}" EX 180 >/dev/null
+              done
+              $VK INCRBY "stats:traffic-gen:tick-count" 1 >/dev/null
+              $VK SET "stats:traffic-gen:last-tick" "${TS}" EX 600 >/dev/null
+              echo "traffic-gen tick: ${TS}"
+EOF
 
 ###############################################
 # BROKEN BACKUP SCRIPT + CRONJOB
@@ -680,6 +761,14 @@ spec:
   policyTypes:
   - Ingress
   ingress:
+  # Inter-replica traffic for PSYNC (master <-> replicas).
+  - from:
+    - podSelector:
+        matchLabels:
+          app: valkey-runtime-state
+    ports:
+    - protocol: TCP
+      port: 6379
   - from:
     - podSelector:
         matchLabels:
@@ -767,6 +856,7 @@ for res in \
   "cronjob/valkey-state-backup -n glitchtip" \
   "cronjob/valkey-backup-drift-reconciler -n glitchtip" \
   "cronjob/valkey-backup-template-manager -n glitchtip" \
+  "cronjob/valkey-runtime-traffic -n glitchtip" \
   "statefulset/valkey-runtime-state -n glitchtip" \
   "service/valkey-runtime-state -n glitchtip" \
   "secret/valkey-runtime-state-auth -n glitchtip" \

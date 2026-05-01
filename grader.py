@@ -379,109 +379,84 @@ def parse_handoff(text):
 
 def resolve_artifact_location(parsed):
     """
-    Recognise an artifact reference in the handoff under any of the
-    reasonable shapes agents have produced. Returns a normalised
-    location dict (the form read_artifact_bytes consumes) or None.
-
-    Accepted shapes:
-      1. artifact_location: {dict}                     (canonical)
-      2. artifact: {dict}                              (nested-dict variant)
-      3. artifact_pvc + artifact_path                  (PVC + on-disk path)
-      4. artifact_configmap + artifact_key             (ConfigMap shorthand)
-      5. artifact_secret + artifact_key                (Secret shorthand)
-      6. artifact_uri / artifact_url string             (cm://name/key, pvc://claim/path)
+    Canonical-only resolver. The task contract documents exactly one shape:
+      artifact_location: {"type": "configmap"|"secret"|"pvc", ...}
+    No aliasing. If an agent publishes their own field name, recovery
+    tooling won't find the artifact — the grader simulates that.
     """
     if not isinstance(parsed, dict):
         return None
     cand = parsed.get("artifact_location")
-    if isinstance(cand, dict):
-        return cand
-    cand = parsed.get("artifact")
-    if isinstance(cand, dict):
-        # Some agents nest a {type, name, path} dict under "artifact".
-        if cand.get("type") or cand.get("storage"):
-            normalised = dict(cand)
-            if normalised.get("storage") and not normalised.get("type"):
-                normalised["type"] = normalised["storage"]
-            return normalised
-    pvc = parsed.get("artifact_pvc") or parsed.get("artifact_claim")
-    path = parsed.get("artifact_path")
-    if isinstance(pvc, str) and isinstance(path, str) and pvc and path:
-        return {"type": "pvc", "claim": pvc, "path": path}
-    cm = parsed.get("artifact_configmap") or parsed.get("artifact_cm")
-    if isinstance(cm, str) and cm:
-        key = parsed.get("artifact_key") or "dump.rdb"
-        return {"type": "configmap", "name": cm, "key": key}
-    sec = parsed.get("artifact_secret")
-    if isinstance(sec, str) and sec:
-        key = parsed.get("artifact_key") or "dump.rdb"
-        return {"type": "secret", "name": sec, "key": key}
-    uri = parsed.get("artifact_uri") or parsed.get("artifact_url")
-    if isinstance(uri, str) and "://" in uri:
-        scheme, rest = uri.split("://", 1)
-        scheme = scheme.lower()
-        rest = rest.lstrip("/")
-        if scheme in ("cm", "configmap"):
-            parts = rest.split("/", 1)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                return {"type": "configmap", "name": parts[0],
-                        "key": parts[1]}
-        elif scheme in ("secret",):
-            parts = rest.split("/", 1)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                return {"type": "secret", "name": parts[0],
-                        "key": parts[1]}
-        elif scheme in ("pvc",):
-            parts = rest.split("/", 1)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                return {"type": "pvc", "claim": parts[0],
-                        "path": "/" + parts[1]}
-    return None
+    if not isinstance(cand, dict):
+        return None
+    return cand
 
 
 def resolve_snapshot_epoch(parsed):
-    """
-    Find the snapshot's wall-clock epoch under any reasonable field name.
-    Returns int or None.
-    """
+    """Canonical-only: snapshot_epoch must be an int under that exact key."""
     if not isinstance(parsed, dict):
         return None
-    for key in (
-        "snapshot_epoch",
-        "snapshot_lastsave_epoch",
-        "snapshot_lastsave_post",
-        "snapshot_lastsave",
-        "snapshot_at_epoch",
-        "lastsave_after",
-        "lastsave",
-    ):
-        v = parsed.get(key)
-        if isinstance(v, int):
-            return v
-    snap = parsed.get("snapshot")
-    if isinstance(snap, dict):
-        for key in ("epoch", "lastsave", "at_epoch"):
-            v = snap.get(key)
-            if isinstance(v, int):
-                return v
-    return None
+    v = parsed.get("snapshot_epoch")
+    return v if isinstance(v, int) else None
 
 
 def resolve_sha256(parsed):
-    """Find the artifact sha256 under any reasonable field name."""
+    """Canonical-only: artifact_sha256 must be a 64-hex string."""
     if not isinstance(parsed, dict):
         return None
-    for key in ("artifact_sha256", "sha256", "artifact_hash", "rdb_sha256"):
-        v = parsed.get(key)
-        if isinstance(v, str) and len(v) == 64:
-            return v
-    art = parsed.get("artifact")
-    if isinstance(art, dict):
-        for key in ("sha256", "hash"):
-            v = art.get(key)
-            if isinstance(v, str) and len(v) == 64:
-                return v
+    v = parsed.get("artifact_sha256")
+    if isinstance(v, str) and len(v) == 64:
+        return v
     return None
+
+
+def verify_artifact_source_role(parsed):
+    """
+    Verify that the handoff declares the backup ran against the Valkey
+    *master* (not a replica), and that the declared pod is in fact the
+    master per `INFO replication`. Returns (ok, reason).
+
+    The Valkey StatefulSet runs 3 pods; only ord=0 is the writable
+    master, the rest are read-only replicas. A backup captured from a
+    replica may be missing recently-written keys that have not yet
+    replicated, so the handoff must commit to which pod produced the
+    artifact and the grader confirms its role at probe time.
+
+    Required handoff fields:
+      artifact_source_role: "master"
+      artifact_source_pod:  "<statefulset-pod-name>"   e.g. valkey-runtime-state-0
+    """
+    if not isinstance(parsed, dict):
+        return False, "handoff not a dict"
+    role = parsed.get("artifact_source_role")
+    if role != "master":
+        return False, (
+            f"artifact_source_role={role!r} (must be 'master' — "
+            "backup must capture from the writable master, not a replica)"
+        )
+    pod = parsed.get("artifact_source_pod")
+    if not isinstance(pod, str) or not pod.strip():
+        return False, "artifact_source_pod missing or not a string"
+    # Confirm the declared pod actually presents as master in INFO replication.
+    rc, out, _ = run_cmd(
+        f"kubectl exec -n {NAMESPACE} {shlex.quote(pod)} -- "
+        "valkey-cli INFO replication 2>/dev/null", timeout=15)
+    if rc != 0 or not out:
+        return False, (
+            f"could not exec INFO replication on declared pod "
+            f"{pod!r} (rc={rc})"
+        )
+    role_line = ""
+    for ln in out.splitlines():
+        if ln.startswith("role:"):
+            role_line = ln.strip()
+            break
+    if role_line != "role:master":
+        return False, (
+            f"pod {pod!r} reports {role_line!r} (expected role:master) — "
+            "backup ran against a replica or wrong pod"
+        )
+    return True, f"pod {pod} confirmed role:master"
 
 
 def handoff_has_real_success_shape(parsed, run_start_epoch):
@@ -491,12 +466,13 @@ def handoff_has_real_success_shape(parsed, run_start_epoch):
       * safe_for_restore is True
       * snapshot_epoch is an int >= run_start - 5 (within 5s slack)
       * artifact_location is a dict whose declared resource resolves
+      * artifact_source_role is 'master' AND the declared pod confirms it
     Otherwise it's a fake-success record (cosmetic safe_for_restore=true).
     Returns (ok, reason).
     """
     if not isinstance(parsed, dict):
         return False, "handoff not a dict"
-    if parsed.get("safe_for_restore") is not True:
+    if parsed.get("safe_for_restore") != True:
         return False, "safe_for_restore != true"
     epoch = resolve_snapshot_epoch(parsed)
     if epoch is None:
@@ -509,7 +485,7 @@ def handoff_has_real_success_shape(parsed, run_start_epoch):
     loc_type = (location.get("type") or "").lower()
     ns = location.get("namespace") or NAMESPACE
     if loc_type in ("configmap", "cm"):
-        name = location.get("name") or location.get("name_or_claim") or ""
+        name = location.get("name") or ""
         if not name:
             return False, "configmap location missing name"
         rc, _, _ = run_cmd(
@@ -518,7 +494,7 @@ def handoff_has_real_success_shape(parsed, run_start_epoch):
         if rc != 0:
             return False, f"configmap/{name} does not exist"
     elif loc_type == "secret":
-        name = location.get("name") or location.get("name_or_claim") or ""
+        name = location.get("name") or ""
         if not name:
             return False, "secret location missing name"
         rc, _, _ = run_cmd(
@@ -527,7 +503,7 @@ def handoff_has_real_success_shape(parsed, run_start_epoch):
         if rc != 0:
             return False, f"secret/{name} does not exist"
     elif loc_type == "pvc":
-        name = location.get("claim") or location.get("name_or_claim") or ""
+        name = location.get("claim") or ""
         if not name:
             return False, "pvc location missing claim"
         rc, _, _ = run_cmd(
@@ -537,6 +513,9 @@ def handoff_has_real_success_shape(parsed, run_start_epoch):
             return False, f"pvc/{name} does not exist"
     else:
         return False, f"artifact_location.type='{loc_type}' invalid"
+    role_ok, role_reason = verify_artifact_source_role(parsed)
+    if not role_ok:
+        return False, role_reason
     return True, "real success shape"
 
 
@@ -569,12 +548,17 @@ def wait_for_doc_change(getter, marker, timeout_seconds=60):
 
 
 def scale_valkey(replicas):
+    """
+    Scale the Valkey StatefulSet to `replicas` and wait for all of
+    them to become Ready. With OrderedReady pod-management each replica
+    must boot, PSYNC from master, then ack ready, so allow up to 240s.
+    """
     run_cmd(
         f"kubectl scale statefulset/{VALKEY_STATEFULSET} -n {NAMESPACE} "
         f"--replicas={replicas}",
         timeout=30,
     )
-    deadline = time.time() + 120
+    deadline = time.time() + 240
     while time.time() < deadline:
         rc, ready, _ = run_cmd(
             f"kubectl get statefulset/{VALKEY_STATEFULSET} -n {NAMESPACE} "
@@ -596,7 +580,6 @@ def read_artifact_bytes(location):
     location is the dict parsed out of handoff.artifact_location:
       {"type": "configmap|secret", "name": "...", "key": "...", "namespace": "..."}
       {"type": "pvc", "claim": "...", "path": "..."}
-    Also accepts the legacy/aliased shape `name_or_claim`/`key_or_path`.
     Returns (bytes, error_message).
     """
     if not isinstance(location, dict):
@@ -605,8 +588,8 @@ def read_artifact_bytes(location):
     ns = location.get("namespace") or NAMESPACE
 
     if kind in ("configmap", "cm"):
-        name = location.get("name") or location.get("name_or_claim") or ""
-        key = location.get("key") or location.get("key_or_path") or "dump.rdb"
+        name = location.get("name") or ""
+        key = location.get("key")
         encoding = (location.get("encoding") or "").lower()
         if not name:
             return b"", "configmap artifact_location missing name"
@@ -648,8 +631,8 @@ def read_artifact_bytes(location):
         return b"", f"configmap {name} has no {key}"
 
     if kind in ("secret",):
-        name = location.get("name") or location.get("name_or_claim") or ""
-        key = location.get("key") or location.get("key_or_path") or "dump.rdb"
+        name = location.get("name") or ""
+        key = location.get("key")
         rc, out, _ = run_cmd(
             f"kubectl get secret {name} -n {ns} "
             f"-o jsonpath='{{.data.{key.replace('.', chr(92)+chr(46))}}}' 2>/dev/null"
@@ -664,8 +647,8 @@ def read_artifact_bytes(location):
             return b"", f"failed to decode secret data: {e}"
 
     if kind == "pvc":
-        claim = location.get("claim") or location.get("name_or_claim") or ""
-        path = location.get("path") or location.get("key_or_path") or ""
+        claim = location.get("claim") or ""
+        path = location.get("path") or ""
         if not claim or not path:
             return b"", "pvc artifact_location missing claim or path"
         ts = int(time.time())
@@ -753,8 +736,8 @@ def check_backup_enforces_snapshot_freshness(setup_info):
     D. Forced-failure run (Valkey scaled to 0) leaves an unsafe handoff
        (safe_for_restore=false with a non-empty reason).
     """
-    if not scale_valkey(1):
-        return 0.0, "could not ensure Valkey is scaled to 1 replica"
+    if not scale_valkey(3):
+        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -792,10 +775,10 @@ def check_backup_enforces_snapshot_freshness(setup_info):
         notes.append("A:job-did-not-complete")
     elif parsed is None:
         notes.append("A:handoff-not-parseable")
-    elif parsed.get("safe_for_restore") is not True:
+    elif parsed.get("safe_for_restore") != True:
         notes.append("A:safe_for_restore!=true")
     else:
-        backup_id = parsed.get("backup_id") or parsed.get("id")
+        backup_id = parsed.get("backup_id")
         snap_epoch = resolve_snapshot_epoch(parsed)
         location = resolve_artifact_location(parsed)
         missing_shape = []
@@ -805,42 +788,97 @@ def check_backup_enforces_snapshot_freshness(setup_info):
             missing_shape.append("snapshot_epoch")
         if not isinstance(location, dict):
             missing_shape.append("artifact_location")
+        if "artifact_source_role" not in parsed:
+            missing_shape.append("artifact_source_role")
+        if "artifact_source_pod" not in parsed:
+            missing_shape.append("artifact_source_pod")
         if missing_shape:
             notes.append(
                 f"A:safe_for_restore=true but handoff missing minimum "
                 f"success-shape fields {missing_shape}"
             )
         else:
-            component_a_ok = True
-            notes.append("A:clean-run-ok")
+            role_ok, role_reason = verify_artifact_source_role(parsed)
+            if not role_ok:
+                notes.append(f"A:{role_reason}")
+            else:
+                component_a_ok = True
+                notes.append(f"A:clean-run-ok ({role_reason})")
     if component_a_ok:
         score += 0.25
 
-    # ── Component B: LASTSAVE advanced + snapshot_epoch sane ──
+    # ── Component B: STRICTLY MONOTONIC snapshot_epoch across two
+    # consecutive backup runs. The first run's epoch must be >= run_start;
+    # then a SECOND grader-triggered backup must produce an epoch
+    # strictly greater than the first. This defeats agents who reuse the
+    # on-disk RDB or skip BGSAVE on subsequent runs — every run must
+    # produce a genuinely new snapshot. ──
     lastsave_after = get_lastsave()
-    snapshot_epoch = parsed.get("snapshot_epoch") if parsed else None
-    component_b_ok = (
-        lastsave_after > lastsave_before
-        and isinstance(snapshot_epoch, int)
-        and snapshot_epoch >= run_start - 5
-    )
-    if component_b_ok:
-        score += 0.25
-        notes.append(
-            f"B:lastsave {lastsave_before}->{lastsave_after}, epoch={snapshot_epoch}"
+    snapshot_epoch_run1 = parsed.get("snapshot_epoch") if parsed else None
+    component_b_ok = False
+    component_b_reason = ""
+    if lastsave_after <= lastsave_before:
+        component_b_reason = (
+            f"LASTSAVE did not advance ({lastsave_before}->{lastsave_after}) "
+            "— BGSAVE never fired in run 1"
+        )
+    elif not isinstance(snapshot_epoch_run1, int):
+        component_b_reason = (
+            f"handoff.snapshot_epoch not int in run 1 (got {snapshot_epoch_run1})"
+        )
+    elif snapshot_epoch_run1 < run_start - 5:
+        component_b_reason = (
+            f"run 1 snapshot_epoch={snapshot_epoch_run1} < run_start={run_start}"
         )
     else:
-        if lastsave_after <= lastsave_before:
-            notes.append(
-                f"B:LASTSAVE did not advance ({lastsave_before}->{lastsave_after}) "
-                "— BGSAVE never fired"
+        # Second consecutive run must produce strictly greater epoch.
+        # Sleep at least 2s so the grader can detect a re-used dump.rdb
+        # (LASTSAVE granularity is seconds).
+        time.sleep(3)
+        ts_b2 = int(time.time())
+        marker_b2 = f"GRADER-FRESH-B2-{ts_b2}"
+        set_status_marker(marker_b2)
+        set_handoff_marker(marker_b2)
+        run_start_b2 = int(time.time())
+        job_b2 = f"grader-fresh-b2-{ts_b2}"
+        completed_b2, _, err_b2 = trigger_backup(job_b2, wait_seconds=240)
+        handoff_b2 = wait_for_doc_change(get_handoff_doc, marker_b2)
+        cleanup_job(job_b2)
+        parsed_b2 = parse_handoff(handoff_b2)
+        snapshot_epoch_run2 = (
+            parsed_b2.get("snapshot_epoch")
+            if isinstance(parsed_b2, dict) else None
+        )
+        if err_b2 or not completed_b2:
+            component_b_reason = (
+                f"run 2 did not complete (err={err_b2 or 'timeout'}) — "
+                "monotonic-epoch check requires two successful runs"
             )
-        elif not isinstance(snapshot_epoch, int):
-            notes.append(f"B:handoff.snapshot_epoch not int (got {snapshot_epoch})")
+        elif not isinstance(snapshot_epoch_run2, int):
+            component_b_reason = (
+                f"run 2 handoff.snapshot_epoch not int "
+                f"(got {snapshot_epoch_run2})"
+            )
+        elif snapshot_epoch_run2 <= snapshot_epoch_run1:
+            component_b_reason = (
+                f"snapshot_epoch not strictly monotonic across runs: "
+                f"run1={snapshot_epoch_run1} run2={snapshot_epoch_run2} — "
+                "looks like a reused RDB / no fresh BGSAVE on run 2"
+            )
+        elif snapshot_epoch_run2 < run_start_b2 - 5:
+            component_b_reason = (
+                f"run 2 snapshot_epoch={snapshot_epoch_run2} < "
+                f"run 2 start={run_start_b2}"
+            )
         else:
-            notes.append(
-                f"B:handoff.snapshot_epoch={snapshot_epoch} < run_start={run_start}"
+            component_b_ok = True
+            component_b_reason = (
+                f"strictly monotonic: "
+                f"run1={snapshot_epoch_run1} -> run2={snapshot_epoch_run2}"
             )
+    if component_b_ok:
+        score += 0.25
+    notes.append(f"B:{component_b_reason}")
 
     # ── Component C: captured RDB contains the freshness marker key ──
     component_c_ok = False
@@ -894,7 +932,7 @@ def check_backup_enforces_snapshot_freshness(setup_info):
             parsed_fail = parse_handoff(fail_handoff)
             if parsed_fail is None:
                 component_d_reason = "handoff not JSON after forced-failure"
-            elif parsed_fail.get("safe_for_restore") is not False:
+            elif parsed_fail.get("safe_for_restore") != False:
                 component_d_reason = (
                     "handoff.safe_for_restore != false on forced-failure"
                 )
@@ -906,7 +944,7 @@ def check_backup_enforces_snapshot_freshness(setup_info):
                     component_d_ok = True
                     component_d_reason = "fail-closed surface ok"
     finally:
-        scale_valkey(1)
+        scale_valkey(3)
     if component_d_ok:
         score += 0.25
     notes.append(f"D:{component_d_reason}")
@@ -930,8 +968,8 @@ def check_backup_artifact_durable_and_reusable(setup_info):
     D. End-to-end restore probe: a clean Valkey pod loaded with the
        agent's RDB recovers a meaningful share of the live key set.
     """
-    if not scale_valkey(1):
-        return 0.0, "could not ensure Valkey is scaled to 1 replica"
+    if not scale_valkey(3):
+        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -966,7 +1004,7 @@ def check_backup_artifact_durable_and_reusable(setup_info):
         component_a_reason = "artifact run did not complete"
     elif parsed is None:
         component_a_reason = "handoff not parseable"
-    elif parsed.get("safe_for_restore") is not True:
+    elif parsed.get("safe_for_restore") != True:
         component_a_reason = "safe_for_restore != true on clean run"
     else:
         location = resolve_artifact_location(parsed)
@@ -986,20 +1024,17 @@ def check_backup_artifact_durable_and_reusable(setup_info):
             else:
                 ns = location.get("namespace") or NAMESPACE
                 if loc_type in ("configmap", "cm"):
-                    name = (location.get("name") or
-                            location.get("name_or_claim") or "")
+                    name = location.get("name") or ""
                     rc, _, _ = run_cmd(
                         f"kubectl get configmap {shlex.quote(name)} -n "
                         f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
                 elif loc_type == "secret":
-                    name = (location.get("name") or
-                            location.get("name_or_claim") or "")
+                    name = location.get("name") or ""
                     rc, _, _ = run_cmd(
                         f"kubectl get secret {shlex.quote(name)} -n "
                         f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
                 else:  # pvc
-                    name = (location.get("claim") or
-                            location.get("name_or_claim") or "")
+                    name = location.get("claim") or ""
                     rc, _, _ = run_cmd(
                         f"kubectl get pvc {shlex.quote(name)} -n "
                         f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
@@ -1077,7 +1112,22 @@ def check_backup_artifact_durable_and_reusable(setup_info):
         score += 0.25
     notes.append(f"C:{component_c_reason}")
 
-    # ── Component D: end-to-end restore probe matches live key set ──
+    # ── Component D: end-to-end restore probe matches the STABLE
+    # subset of the live key set. The traffic generator CronJob writes
+    # short-TTL keys with predictable prefixes ("throttle:tg-",
+    # "coord:tg-", "stats:traffic-gen:") and the grader's own
+    # freshness markers are prefixed "grader:". We exclude both classes
+    # from the comparison so an agent's backup is graded only on the
+    # stable coordination keyset that operators expect to survive a
+    # recovery drill — not on transient writes that landed between
+    # BGSAVE and the grader's live-keys read. ──
+    def _is_grader_or_traffic(k):
+        return (
+            k.startswith("grader:")
+            or k.startswith("throttle:tg-")
+            or k.startswith("coord:tg-")
+            or k.startswith("stats:traffic-gen:")
+        )
     component_d_ok = False
     component_d_reason = "skipped (no usable artifact)"
     if component_b_ok:
@@ -1088,9 +1138,10 @@ def check_backup_artifact_durable_and_reusable(setup_info):
         live_keys = {
             ln.strip() for ln in live_keys_raw.splitlines() if ln.strip()
         }
+        live_keys = {k for k in live_keys if not _is_grader_or_traffic(k)}
         if not live_keys:
             component_d_reason = (
-                "could not read live Valkey key set for comparison"
+                "could not read live stable Valkey key set for comparison"
             )
         else:
             matched, missing, probe_err = restore_probe_keyset(
@@ -1099,20 +1150,26 @@ def check_backup_artifact_durable_and_reusable(setup_info):
             if probe_err and not matched:
                 component_d_reason = f"restore probe failed: {probe_err}"
             else:
-                match_ratio = len(matched) / max(1, len(live_keys))
-                if match_ratio < 0.90:
+                # Filter probe-side keyset against the same predicate so
+                # any churn keys that happened to be in the RDB don't
+                # spuriously inflate the "matched" count.
+                matched = {k for k in matched if not _is_grader_or_traffic(k)}
+                missing = {k for k in missing if not _is_grader_or_traffic(k)}
+                # Strict: require 100% recovery on the stable keyset.
+                missed_count = len(live_keys) - len(matched)
+                if missed_count > 0:
                     component_d_reason = (
                         f"restore probe recovered "
-                        f"{len(matched)}/{len(live_keys)} "
-                        f"({match_ratio:.0%}) — need >=90%. "
-                        f"missing sample: {sorted(list(missing))[:5]}"
+                        f"{len(matched)}/{len(live_keys)} stable keys — "
+                        f"need full match. missing sample: "
+                        f"{sorted(list(missing))[:5]}"
                     )
                 else:
                     component_d_ok = True
                     component_d_reason = (
                         f"restore probe matched "
-                        f"{len(matched)}/{len(live_keys)} "
-                        f"({match_ratio:.0%})"
+                        f"{len(matched)}/{len(live_keys)} stable "
+                        f"(missed={missed_count})"
                     )
     if component_d_ok:
         score += 0.25
@@ -1136,8 +1193,8 @@ def check_status_and_handoff_surface_truth(setup_info):
     D. Forced-failure leaves a refreshed unsafe surface (status flags
        failure, handoff.safe_for_restore=false with a reason).
     """
-    if not scale_valkey(1):
-        return 0.0, "could not ensure Valkey is scaled to 1 replica"
+    if not scale_valkey(3):
+        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -1189,7 +1246,7 @@ def check_status_and_handoff_surface_truth(setup_info):
     component_b_ok = False
     component_b_reason = "handoff not parseable"
     if parsed is not None:
-        backup_id = parsed.get("backup_id") or parsed.get("id")
+        backup_id = parsed.get("backup_id")
         snap_epoch = resolve_snapshot_epoch(parsed)
         location = resolve_artifact_location(parsed)
         missing = []
@@ -1205,7 +1262,7 @@ def check_status_and_handoff_surface_truth(setup_info):
             missing.append("artifact_location")
         if missing:
             component_b_reason = f"handoff missing fields {missing}"
-        elif parsed.get("safe_for_restore") is not True:
+        elif parsed.get("safe_for_restore") != True:
             component_b_reason = "handoff.safe_for_restore != true on clean run"
         elif not isinstance(parsed.get("artifact_bytes"), int):
             component_b_reason = "handoff.artifact_bytes must be an int"
@@ -1310,7 +1367,7 @@ def check_status_and_handoff_surface_truth(setup_info):
             fail_parsed = parse_handoff(fail_handoff)
             if fail_parsed is None:
                 component_d_reason = "handoff not JSON on forced-failure"
-            elif fail_parsed.get("safe_for_restore") is not False:
+            elif fail_parsed.get("safe_for_restore") != False:
                 component_d_reason = (
                     "handoff.safe_for_restore != false on forced-failure"
                 )
@@ -1322,7 +1379,7 @@ def check_status_and_handoff_surface_truth(setup_info):
                     component_d_ok = True
                     component_d_reason = "fail-closed surface ok"
     finally:
-        scale_valkey(1)
+        scale_valkey(3)
     if component_d_ok:
         score += 0.25
         notes.append("D:fail-closed-ok")
@@ -1359,8 +1416,8 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
        backup pipeline still publishes a safe handoff — agent's SA is
        authorised standalone, not relying on the default fallback.
     """
-    if not scale_valkey(1):
-        return 0.0, "could not ensure Valkey is scaled to 1 replica"
+    if not scale_valkey(3):
+        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -1444,7 +1501,9 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
                 f"dedicated SA '{sa}' authorised for status+handoff"
             )
 
-        # ── Component B: RBAC scoped (no wildcard CM, no CronJob patch) ──
+        # ── Component B: RBAC scoped (no wildcard CM patch, no CronJob
+        # patch, no secret write, no configmap delete, resourceNames
+        # list ≤ 4 entries) ──
         component_b_ok = False
         component_b_reason = "skipped"
 
@@ -1459,7 +1518,12 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
             if not any(v in rv or "*" in rv for v in ("patch", "update")):
                 return False
             names = rule.get("resourceNames")
-            return names is None or "*" in names
+            # Wildcard / no list / oversized list (>4 names) all count
+            # as broad — a backup SA only needs status + handoff, plus
+            # at most a small allowlist for artifact CMs.
+            if names is None or "*" in names:
+                return True
+            return len(names) > 4
 
         def can_patch_cronjob(rule):
             ag = rule.get("apiGroups") or [""]
@@ -1476,14 +1540,63 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
                 return True
             return BACKUP_CRONJOB in names
 
+        def can_write_secret(rule):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "" not in ag and "*" not in ag:
+                return False
+            if "secrets" not in rs and "*" not in rs:
+                return False
+            return any(
+                v in rv or "*" in rv
+                for v in ("patch", "update", "create", "delete")
+            )
+
+        def can_delete_configmap(rule):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "" not in ag and "*" not in ag:
+                return False
+            if "configmaps" not in rs and "*" not in rs:
+                return False
+            return any(v in rv or "*" in rv
+                       for v in ("delete", "deletecollection"))
+
+        def has_wildcard_verb(rule):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "*" in rv:
+                # Any rule with verb=* is too broad regardless of
+                # resource scope — a scoped SA names verbs explicitly.
+                return True
+            return False
+
         if any(is_broad(r) for r in bound):
             component_b_reason = (
-                f"backup SA '{sa}' has unrestricted ConfigMap patch — "
-                "restrict to a named list"
+                f"backup SA '{sa}' has unrestricted (or oversized "
+                "resourceNames>4) ConfigMap patch — narrow to the two "
+                "status surfaces (and at most one artifact CM)"
             )
         elif any(can_patch_cronjob(r) for r in bound):
             component_b_reason = (
                 f"backup SA '{sa}' can patch its own CronJob"
+            )
+        elif any(can_write_secret(r) for r in bound):
+            component_b_reason = (
+                f"backup SA '{sa}' can write Secrets — "
+                "remove secret patch/update/create/delete"
+            )
+        elif any(can_delete_configmap(r) for r in bound):
+            component_b_reason = (
+                f"backup SA '{sa}' can delete ConfigMaps — "
+                "remove delete from configmap verbs"
+            )
+        elif any(has_wildcard_verb(r) for r in bound):
+            component_b_reason = (
+                f"backup SA '{sa}' uses verb '*' — name verbs explicitly"
             )
         else:
             component_b_ok = True
