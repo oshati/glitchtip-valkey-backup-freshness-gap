@@ -342,6 +342,13 @@ def trigger_backup(job_name, wait_seconds=300):
             timeout=20,
         )
         logs = f"[no container logs]\npods:\n{pods}\n---\nrecent events:\n{ev}"
+    # Diagnostic: surface backup pod logs whenever the Job did not
+    # reach Succeeded — agent debugging is impossible otherwise.
+    if not completed:
+        print(f"[grader] trigger_backup({job_name}) NOT completed — "
+              f"backup pod logs (last 300 lines):")
+        print(logs[-4000:] if len(logs) > 4000 else logs)
+        print(f"[grader] --- end backup pod logs for {job_name} ---")
     return completed, logs, ""
 
 
