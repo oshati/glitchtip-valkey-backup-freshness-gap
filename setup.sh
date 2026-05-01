@@ -353,8 +353,7 @@ metadata:
     component: valkey-backup
   annotations:
     description: "Backs up GlitchTip's Valkey runtime state. Runs hourly."
-    owner-note: "Currently runs as the glitchtip namespace 'default' SA — replace with a dedicated, narrowly-scoped SA (patch/update only on glitchtip-valkey-backup-status + glitchtip-valkey-backup-restore-handoff, plus create on configmaps for the artifact). Do NOT reuse backup-drift-reconciler-sa."
-    source-of-truth-note: "The 'serviceAccountName' field on this CronJob is reconciled every minute from configmap/valkey-state-backup-template-baseline by the valkey-backup-template-manager CronJob. Any patch you make directly to this CronJob will be reverted within ~60s — update the template-baseline ConfigMap's 'serviceAccountName' key to make the change durable."
+    description: "Backs up GlitchTip's Valkey runtime state. Runs hourly."
 spec:
   schedule: "17 * * * *"
   concurrencyPolicy: Forbid
@@ -463,14 +462,12 @@ data:
     - Validation: snapshot existence only — does NOT prove freshness
     - Retention: 3 successful job history entries
 
-    ### Known Gaps (the runbook items to close)
-    - The backup script does not prove the captured snapshot is current.
-    - The run note has historically lagged behind the actual run, and the
-      numeric values it reports must agree with handoff.json byte-for-byte.
-    - The CronJob runs as the glitchtip namespace's `default` ServiceAccount —
-      a dedicated, narrowly-scoped SA for the backup job is the platform
-      standard. (`backup-drift-reconciler-sa` is for the reconciler only —
-      do NOT reuse it for the backup CronJob.)
+    ### Symptoms reported during the recovery drill
+    - Restored runtime state was clearly older than the time the run record
+      claimed.
+    - On-call could not tell from this note alone whether the captured
+      artifact was real, current, or recoverable.
+    - The pod-local scratch directory does not survive node turnover.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -483,36 +480,15 @@ metadata:
 data:
   handoff.json: |
     {
-      "_schema_doc": "Downstream recovery tooling reads this file. Every backup run MUST overwrite this with the schema below — refer to glitchtip-valkey-backup-status/status.md for the human-readable contract.",
-      "_required_keys_on_success": [
-        "latest_run", "backup_id", "result", "safe_for_restore",
-        "snapshot_epoch", "artifact_bytes", "artifact_location", "restore_proof"
-      ],
-      "_required_keys_on_failure": [
-        "latest_run", "result", "safe_for_restore", "reason"
-      ],
-      "_artifact_location_shape": {
-        "configmap_or_secret": {"type": "configmap | cm | secret", "name": "<resource name>", "key": "<data key>", "namespace": "<optional>"},
-        "pvc": {"type": "pvc", "claim": "<pvc name>", "path": "<mount path>", "namespace": "<optional>"}
-      },
-      "_restore_proof_shape": {
-        "key_count_at_snapshot": "<int, must be > 0 and reflect a real DBSIZE>",
-        "rdb_magic_ok": "<bool>"
-      },
-      "_freshness_contract": "Each successful publish MUST set snapshot_epoch strictly greater than the previous publish (monotonic). The artifact_bytes value here MUST equal the bytes count reported in glitchtip-valkey-backup-status/status.md.",
-      "_integrity_contract": "Each successful publish MUST include 'artifact_sha256': the lowercase 64-char hex digest of the bytes actually stored in artifact_location. Recovery tooling refuses to load any artifact whose retrieved sha256 disagrees with this field.",
-      "_audit_contract": "Each successful publish MUST include 'previous_run': {snapshot_epoch:<int>, backup_id:<str>} carried forward from the prior publish. The backup script must READ this file before WRITING — overwriting handoff blind loses the audit chain.",
-      "_restorability_contract": "The artifact at artifact_location MUST, when loaded into a clean Valkey instance, restore the same key set that was live at snapshot_epoch (>=90% match). Recovery tooling validates this by spinning up a probe Valkey and running KEYS *.",
       "latest_run": "2026-03-30T02:17:11Z",
       "backup_id": "valkey-20260330_021711",
       "result": "success",
       "safe_for_restore": true,
-      "artifact_location": {
-        "type": "ephemeral",
-        "note": "current pipeline writes to emptyDir — NOT durable, must be replaced"
-      },
-      "previous_run": null,
-      "restore_proof": null
+      "artifact_bytes": 214562,
+      "notes": [
+        "Downstream recovery tooling reads this file before attempting a restore.",
+        "This record is stale until the current pipeline refreshes it."
+      ]
     }
 EOF
 
@@ -537,8 +513,6 @@ kind: ServiceAccount
 metadata:
   name: backup-drift-reconciler-sa
   namespace: glitchtip
-  annotations:
-    purpose: "ONLY for the drift-reconciler CronJob. Do NOT reuse for the valkey-state-backup job — that needs its own dedicated, narrowly-scoped SA."
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

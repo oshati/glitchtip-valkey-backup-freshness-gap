@@ -11,11 +11,12 @@ STATUS_CM=glitchtip-valkey-backup-status
 HANDOFF_CM=glitchtip-valkey-backup-restore-handoff
 SA=valkey-backup-publisher
 
-echo "[solution] Neutralizing drift reconcilers that would revert the fix..."
-kubectl delete cronjob valkey-backup-drift-reconciler -n ${NS} --ignore-not-found
-kubectl delete cronjob valkey-backup-template-manager -n ${NS} --ignore-not-found
-kubectl delete job -n ${NS} -l app=glitchtip --field-selector status.successful=0 --ignore-not-found 2>/dev/null || true
-
+# IN-PLACE FIX: the drift reconciler + template manager CronJobs are
+# part of the supported job-management flow, so we leave them running
+# and instead overwrite the baselines they reapply each minute (the
+# script-baseline + template-baseline ConfigMaps below). That way the
+# next reconcile tick keeps publishing OUR fixed script + scoped SA
+# instead of reverting them.
 echo "[solution] Writing the fixed backup script..."
 cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 #!/bin/sh
@@ -271,11 +272,21 @@ patch_cm "${HANDOFF_CM}" "handoff.json" "/tmp/handoff-body.json" || publish_fail
 echo "[backup] ${BACKUP_ID}: SUCCESS (size=${SIZE}, sha=${RDB_SHA256:0:12}, keys=${DBSIZE}, lastsave ${PREV_LASTSAVE}->${NEW_LASTSAVE})"
 SCRIPT_EOF
 
-echo "[solution] Installing fixed script (active + approved baseline)..."
-kubectl create configmap ${SCRIPT_CM} -n ${NS} \
+# Order matters: update the BASELINEs first so the next reconciler tick
+# reapplies our fixed script + scoped SA, then update the active
+# resources for immediate effect.
+echo "[solution] Updating script-baseline (drift reconciler source) first..."
+kubectl create configmap ${SCRIPT_BASELINE_CM} -n ${NS} \
   --from-file=backup.sh=/tmp/valkey-backup-fixed.sh \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl create configmap ${SCRIPT_BASELINE_CM} -n ${NS} \
+
+echo "[solution] Updating template-baseline (template manager source)..."
+kubectl create configmap ${TEMPLATE_BASELINE_CM} -n ${NS} \
+  --from-literal=serviceAccountName=${SA} \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+echo "[solution] Installing fixed script as the active script ConfigMap..."
+kubectl create configmap ${SCRIPT_CM} -n ${NS} \
   --from-file=backup.sh=/tmp/valkey-backup-fixed.sh \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -317,11 +328,6 @@ roleRef:
   name: ${SA}-writer
   apiGroup: rbac.authorization.k8s.io
 RBAC_EOF
-
-echo "[solution] Updating the template baseline so future reconciles preserve the fix..."
-kubectl create configmap ${TEMPLATE_BASELINE_CM} -n ${NS} \
-  --from-literal=serviceAccountName=${SA} \
-  --dry-run=client -o yaml | kubectl apply -f -
 
 echo "[solution] Patching the CronJob to use the scoped ServiceAccount..."
 kubectl patch cronjob ${CRONJOB} -n ${NS} --type merge -p "$(cat <<PATCH

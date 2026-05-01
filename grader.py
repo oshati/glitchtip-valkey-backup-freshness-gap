@@ -377,6 +377,169 @@ def parse_handoff(text):
         return None
 
 
+def resolve_artifact_location(parsed):
+    """
+    Recognise an artifact reference in the handoff under any of the
+    reasonable shapes agents have produced. Returns a normalised
+    location dict (the form read_artifact_bytes consumes) or None.
+
+    Accepted shapes:
+      1. artifact_location: {dict}                     (canonical)
+      2. artifact: {dict}                              (nested-dict variant)
+      3. artifact_pvc + artifact_path                  (PVC + on-disk path)
+      4. artifact_configmap + artifact_key             (ConfigMap shorthand)
+      5. artifact_secret + artifact_key                (Secret shorthand)
+      6. artifact_uri / artifact_url string             (cm://name/key, pvc://claim/path)
+    """
+    if not isinstance(parsed, dict):
+        return None
+    cand = parsed.get("artifact_location")
+    if isinstance(cand, dict):
+        return cand
+    cand = parsed.get("artifact")
+    if isinstance(cand, dict):
+        # Some agents nest a {type, name, path} dict under "artifact".
+        if cand.get("type") or cand.get("storage"):
+            normalised = dict(cand)
+            if normalised.get("storage") and not normalised.get("type"):
+                normalised["type"] = normalised["storage"]
+            return normalised
+    pvc = parsed.get("artifact_pvc") or parsed.get("artifact_claim")
+    path = parsed.get("artifact_path")
+    if isinstance(pvc, str) and isinstance(path, str) and pvc and path:
+        return {"type": "pvc", "claim": pvc, "path": path}
+    cm = parsed.get("artifact_configmap") or parsed.get("artifact_cm")
+    if isinstance(cm, str) and cm:
+        key = parsed.get("artifact_key") or "dump.rdb"
+        return {"type": "configmap", "name": cm, "key": key}
+    sec = parsed.get("artifact_secret")
+    if isinstance(sec, str) and sec:
+        key = parsed.get("artifact_key") or "dump.rdb"
+        return {"type": "secret", "name": sec, "key": key}
+    uri = parsed.get("artifact_uri") or parsed.get("artifact_url")
+    if isinstance(uri, str) and "://" in uri:
+        scheme, rest = uri.split("://", 1)
+        scheme = scheme.lower()
+        rest = rest.lstrip("/")
+        if scheme in ("cm", "configmap"):
+            parts = rest.split("/", 1)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return {"type": "configmap", "name": parts[0],
+                        "key": parts[1]}
+        elif scheme in ("secret",):
+            parts = rest.split("/", 1)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return {"type": "secret", "name": parts[0],
+                        "key": parts[1]}
+        elif scheme in ("pvc",):
+            parts = rest.split("/", 1)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return {"type": "pvc", "claim": parts[0],
+                        "path": "/" + parts[1]}
+    return None
+
+
+def resolve_snapshot_epoch(parsed):
+    """
+    Find the snapshot's wall-clock epoch under any reasonable field name.
+    Returns int or None.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    for key in (
+        "snapshot_epoch",
+        "snapshot_lastsave_epoch",
+        "snapshot_lastsave_post",
+        "snapshot_lastsave",
+        "snapshot_at_epoch",
+        "lastsave_after",
+        "lastsave",
+    ):
+        v = parsed.get(key)
+        if isinstance(v, int):
+            return v
+    snap = parsed.get("snapshot")
+    if isinstance(snap, dict):
+        for key in ("epoch", "lastsave", "at_epoch"):
+            v = snap.get(key)
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def resolve_sha256(parsed):
+    """Find the artifact sha256 under any reasonable field name."""
+    if not isinstance(parsed, dict):
+        return None
+    for key in ("artifact_sha256", "sha256", "artifact_hash", "rdb_sha256"):
+        v = parsed.get(key)
+        if isinstance(v, str) and len(v) == 64:
+            return v
+    art = parsed.get("artifact")
+    if isinstance(art, dict):
+        for key in ("sha256", "hash"):
+            v = art.get(key)
+            if isinstance(v, str) and len(v) == 64:
+                return v
+    return None
+
+
+def handoff_has_real_success_shape(parsed, run_start_epoch):
+    """
+    A handoff is a 'real' success record only if:
+      * it's a parseable dict
+      * safe_for_restore is True
+      * snapshot_epoch is an int >= run_start - 5 (within 5s slack)
+      * artifact_location is a dict whose declared resource resolves
+    Otherwise it's a fake-success record (cosmetic safe_for_restore=true).
+    Returns (ok, reason).
+    """
+    if not isinstance(parsed, dict):
+        return False, "handoff not a dict"
+    if parsed.get("safe_for_restore") is not True:
+        return False, "safe_for_restore != true"
+    epoch = resolve_snapshot_epoch(parsed)
+    if epoch is None:
+        return False, "no recognised snapshot_epoch field (int)"
+    if epoch < run_start_epoch - 5:
+        return False, f"snapshot_epoch={epoch} < run_start={run_start_epoch}"
+    location = resolve_artifact_location(parsed)
+    if not isinstance(location, dict):
+        return False, "no recognised artifact_location reference"
+    loc_type = (location.get("type") or "").lower()
+    ns = location.get("namespace") or NAMESPACE
+    if loc_type in ("configmap", "cm"):
+        name = location.get("name") or location.get("name_or_claim") or ""
+        if not name:
+            return False, "configmap location missing name"
+        rc, _, _ = run_cmd(
+            f"kubectl get configmap {shlex.quote(name)} -n "
+            f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return False, f"configmap/{name} does not exist"
+    elif loc_type == "secret":
+        name = location.get("name") or location.get("name_or_claim") or ""
+        if not name:
+            return False, "secret location missing name"
+        rc, _, _ = run_cmd(
+            f"kubectl get secret {shlex.quote(name)} -n "
+            f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return False, f"secret/{name} does not exist"
+    elif loc_type == "pvc":
+        name = location.get("claim") or location.get("name_or_claim") or ""
+        if not name:
+            return False, "pvc location missing claim"
+        rc, _, _ = run_cmd(
+            f"kubectl get pvc {shlex.quote(name)} -n "
+            f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+        if rc != 0:
+            return False, f"pvc/{name} does not exist"
+    else:
+        return False, f"artifact_location.type='{loc_type}' invalid"
+    return True, "real success shape"
+
+
 def set_status_marker(marker):
     payload = json.dumps({"data": {STATUS_KEY: marker}})
     run_cmd(
@@ -444,27 +607,45 @@ def read_artifact_bytes(location):
     if kind in ("configmap", "cm"):
         name = location.get("name") or location.get("name_or_claim") or ""
         key = location.get("key") or location.get("key_or_path") or "dump.rdb"
+        encoding = (location.get("encoding") or "").lower()
         if not name:
             return b"", "configmap artifact_location missing name"
+        # 1. Try binaryData (auto-base64 by k8s).
         rc, out, _ = run_cmd(
             f"kubectl get configmap {name} -n {ns} "
             f"-o jsonpath='{{.binaryData.{key.replace('.', chr(92)+chr(46))}}}' 2>/dev/null"
         )
         b64 = out.strip("'")
-        if not b64:
-            rc, out, _ = run_cmd(
-                f"kubectl get configmap {name} -n {ns} "
-                f"-o jsonpath='{{.data.{key.replace('.', chr(92)+chr(46))}}}' 2>/dev/null"
-            )
-            raw = out.strip("'")
-            if raw:
-                return raw.encode("utf-8", errors="replace"), ""
-            return b"", f"configmap {name} has no {key}"
-        try:
-            import base64 as _b64
-            return _b64.b64decode(b64), ""
-        except Exception as e:
-            return b"", f"failed to decode binaryData: {e}"
+        if b64:
+            try:
+                import base64 as _b64
+                return _b64.b64decode(b64), ""
+            except Exception as e:
+                return b"", f"failed to decode binaryData: {e}"
+        # 2. Try data — accept both raw text and base64-encoded text
+        # (when handoff or CM annotation declares encoding=base64).
+        rc, out, _ = run_cmd(
+            f"kubectl get configmap {name} -n {ns} "
+            f"-o jsonpath='{{.data.{key.replace('.', chr(92)+chr(46))}}}' 2>/dev/null"
+        )
+        raw = out.strip("'")
+        if raw:
+            # Per-CM annotation can declare base64 encoding too.
+            if encoding != "base64":
+                rc2, ann_out, _ = run_cmd(
+                    f"kubectl get configmap {name} -n {ns} "
+                    "-o jsonpath='{.metadata.annotations.encoding}' 2>/dev/null"
+                )
+                if ann_out.strip("'").lower() == "base64":
+                    encoding = "base64"
+            if encoding == "base64":
+                try:
+                    import base64 as _b64
+                    return _b64.b64decode(raw), ""
+                except Exception as e:
+                    return b"", f"failed to decode data (base64): {e}"
+            return raw.encode("utf-8", errors="replace"), ""
+        return b"", f"configmap {name} has no {key}"
 
     if kind in ("secret",):
         name = location.get("name") or location.get("name_or_claim") or ""
@@ -560,20 +741,24 @@ spec:
 # CHECK 1: backup_enforces_snapshot_freshness
 # ─────────────────────────────────────────────
 def check_backup_enforces_snapshot_freshness(setup_info):
+    """
+    Partial-credit subscore: 4 independent quarter-credit components.
+
+    A. Backup job completes on a clean run and refreshes the handoff
+       (handoff is parseable JSON with safe_for_restore=true).
+    B. Valkey LASTSAVE actually advanced during the run (BGSAVE fired)
+       AND handoff.snapshot_epoch is an int >= run_start.
+    C. The agent's captured RDB physically contains a freshness marker
+       key written by the grader between marker-set and backup-trigger.
+    D. Forced-failure run (Valkey scaled to 0) leaves an unsafe handoff
+       (safe_for_restore=false with a non-empty reason).
+    """
     if not scale_valkey(1):
         return 0.0, "could not ensure Valkey is scaled to 1 replica"
-    # Wait for valkey to be exec-ready
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
         time.sleep(2)
-
-    # Snapshot the previously-published snapshot_epoch so we can require
-    # strict monotonic advance after the clean run.
-    pre_handoff = parse_handoff(get_handoff_doc()) or {}
-    prior_snapshot_epoch = pre_handoff.get("snapshot_epoch")
-    if not isinstance(prior_snapshot_epoch, int):
-        prior_snapshot_epoch = 0
 
     lastsave_before = get_lastsave()
     run_start = int(time.time())
@@ -582,112 +767,169 @@ def check_backup_enforces_snapshot_freshness(setup_info):
     set_status_marker(marker)
     set_handoff_marker(marker)
 
-    # Cryptographic freshness proof: write a unique marker key DIRECTLY
-    # into Valkey BEFORE triggering backup. The agent's stored RDB MUST
-    # contain this key — proves the snapshot was captured post-marker
-    # and not recycled / forged. Agents who don't actually run BGSAVE
-    # against live Valkey after this write physically cannot pass.
     rdb_marker_name = f"grader:freshness:{ts}"
     rdb_marker_value = f"PROOF-{ts}-NONCE-{os.urandom(8).hex()}"
-    if not write_marker_key(rdb_marker_name, rdb_marker_value):
-        return 0.0, "grader could not write freshness marker into Valkey"
+    marker_written = write_marker_key(rdb_marker_name, rdb_marker_value)
 
     job = f"grader-fresh-{ts}"
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     handoff = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
+
+    score = 0.0
+    notes = []
+
+    parsed = parse_handoff(handoff) if handoff else None
+
+    # ── Component A: clean run completes with a minimum success record ──
+    # Not just safe_for_restore=true — the handoff must declare the
+    # success-shape fields the rest of the pipeline relies on so that
+    # agents who publish a bare `{"safe_for_restore": true}` don't pass.
+    component_a_ok = False
     if err:
-        return 0.0, err
-    if not completed:
-        return 0.0, f"clean freshness run did not succeed. logs tail:\n{logs[-400:]}"
-    parsed = parse_handoff(handoff)
-    if parsed is None:
-        return 0.0, f"handoff is not valid JSON after clean run: {handoff[:300]}"
-    if parsed.get("safe_for_restore") is not True:
-        return 0.0, f"handoff safe_for_restore != true on clean run: {str(parsed)[:300]}"
-    snapshot_epoch = parsed.get("snapshot_epoch")
-    if not isinstance(snapshot_epoch, int) or snapshot_epoch < run_start - 5:
-        return 0.0, (
-            f"handoff.snapshot_epoch={snapshot_epoch} not >= run_start={run_start} "
-            "(agent didn't force a fresh snapshot)"
-        )
-    if snapshot_epoch <= prior_snapshot_epoch:
-        return 0.0, (
-            f"handoff.snapshot_epoch={snapshot_epoch} did not strictly advance "
-            f"past prior published epoch={prior_snapshot_epoch} — backup is "
-            "republishing a stale value rather than capturing a fresh snapshot"
-        )
+        notes.append(f"A:err={err}")
+    elif not completed:
+        notes.append("A:job-did-not-complete")
+    elif parsed is None:
+        notes.append("A:handoff-not-parseable")
+    elif parsed.get("safe_for_restore") is not True:
+        notes.append("A:safe_for_restore!=true")
+    else:
+        backup_id = parsed.get("backup_id") or parsed.get("id")
+        snap_epoch = resolve_snapshot_epoch(parsed)
+        location = resolve_artifact_location(parsed)
+        missing_shape = []
+        if not isinstance(backup_id, str) or not backup_id.strip():
+            missing_shape.append("backup_id")
+        if snap_epoch is None:
+            missing_shape.append("snapshot_epoch")
+        if not isinstance(location, dict):
+            missing_shape.append("artifact_location")
+        if missing_shape:
+            notes.append(
+                f"A:safe_for_restore=true but handoff missing minimum "
+                f"success-shape fields {missing_shape}"
+            )
+        else:
+            component_a_ok = True
+            notes.append("A:clean-run-ok")
+    if component_a_ok:
+        score += 0.25
+
+    # ── Component B: LASTSAVE advanced + snapshot_epoch sane ──
     lastsave_after = get_lastsave()
-    if lastsave_after <= lastsave_before:
-        return 0.0, (
-            f"Valkey LASTSAVE did not advance "
-            f"(before={lastsave_before}, after={lastsave_after}) "
-            "— BGSAVE/SYNC never fired"
+    snapshot_epoch = parsed.get("snapshot_epoch") if parsed else None
+    component_b_ok = (
+        lastsave_after > lastsave_before
+        and isinstance(snapshot_epoch, int)
+        and snapshot_epoch >= run_start - 5
+    )
+    if component_b_ok:
+        score += 0.25
+        notes.append(
+            f"B:lastsave {lastsave_before}->{lastsave_after}, epoch={snapshot_epoch}"
         )
+    else:
+        if lastsave_after <= lastsave_before:
+            notes.append(
+                f"B:LASTSAVE did not advance ({lastsave_before}->{lastsave_after}) "
+                "— BGSAVE never fired"
+            )
+        elif not isinstance(snapshot_epoch, int):
+            notes.append(f"B:handoff.snapshot_epoch not int (got {snapshot_epoch})")
+        else:
+            notes.append(
+                f"B:handoff.snapshot_epoch={snapshot_epoch} < run_start={run_start}"
+            )
 
-    # Marker-key proof: retrieve agent's stored artifact and verify the
-    # grader-injected marker is present inside the RDB bytes. This is
-    # unforgeable — agents who copy / fake metadata without actually
-    # capturing fresh Valkey state cannot satisfy it.
-    location = parsed.get("artifact_location")
-    if not isinstance(location, dict):
-        return 0.0, "freshness check needs artifact_location dict to verify marker"
-    rdb_bytes, art_err = read_artifact_bytes(location)
-    if art_err or not rdb_bytes:
-        return 0.0, (
-            "could not retrieve agent's stored artifact to verify freshness "
-            f"marker: {art_err or 'no bytes'}"
-        )
-    if not rdb_contains_marker(rdb_bytes, rdb_marker_name, rdb_marker_value):
-        return 0.0, (
-            f"freshness marker key '{rdb_marker_name}' (value PROOF-{ts}-...) "
-            "is NOT present in the captured RDB — the snapshot does not "
-            "reflect Valkey state at the moment backup was requested"
-        )
+    # ── Component C: captured RDB contains the freshness marker key ──
+    component_c_ok = False
+    component_c_reason = "skipped (no artifact_location to read)"
+    if not marker_written:
+        component_c_reason = "grader could not write freshness marker into Valkey"
+    elif parsed is not None:
+        location = resolve_artifact_location(parsed)
+        if not isinstance(location, dict):
+            component_c_reason = "no recognised artifact_location reference"
+        else:
+            rdb_bytes, art_err = read_artifact_bytes(location)
+            if art_err or not rdb_bytes:
+                component_c_reason = (
+                    f"could not read artifact for marker check: "
+                    f"{art_err or 'no bytes'}"
+                )
+            elif not rdb_contains_marker(
+                rdb_bytes, rdb_marker_name, rdb_marker_value
+            ):
+                component_c_reason = (
+                    f"freshness marker '{rdb_marker_name}' not in captured RDB"
+                )
+            else:
+                component_c_ok = True
+                component_c_reason = "marker present in RDB"
+    if component_c_ok:
+        score += 0.25
+        notes.append(f"C:{component_c_reason}")
+    else:
+        notes.append(f"C:{component_c_reason}")
 
-    # Forced-failure scenario: scale Valkey to 0 and run backup. Must fail closed.
+    # ── Component D: forced-failure run leaves unsafe handoff with reason ──
     ts2 = int(time.time())
     fail_marker = f"GRADER-FRESH-FAIL-{ts2}"
     set_status_marker(fail_marker)
     set_handoff_marker(fail_marker)
     scale_valkey(0)
+    component_d_ok = False
+    component_d_reason = "forced-failure not evaluated"
     try:
         fail_job = f"grader-fresh-fail-{ts2}"
-        completed2, logs2, err2 = trigger_backup(fail_job, wait_seconds=180)
+        completed2, _logs2, _ = trigger_backup(fail_job, wait_seconds=180)
         fail_handoff = wait_for_doc_change(get_handoff_doc, fail_marker)
         cleanup_job(fail_job)
         if completed2:
-            return 0.0, (
-                "forced-failure run succeeded even though Valkey was scaled to 0 — "
-                "backup pipeline is not validating Valkey reachability"
+            component_d_reason = (
+                "forced-failure run succeeded — pipeline not validating Valkey"
             )
-        parsed_fail = parse_handoff(fail_handoff)
-        if parsed_fail is None:
-            return 0.0, (
-                "handoff not refreshed / not JSON after forced-failure run; "
-                f"content: {fail_handoff[:300]}"
-            )
-        if parsed_fail.get("safe_for_restore") is not False:
-            return 0.0, (
-                "handoff safe_for_restore is not false after forced-failure run — "
-                "pipeline does not fail closed"
-            )
-        reason = parsed_fail.get("reason") or ""
-        if not isinstance(reason, str) or not reason.strip():
-            return 0.0, "handoff has no reason on forced-failure run"
+        else:
+            parsed_fail = parse_handoff(fail_handoff)
+            if parsed_fail is None:
+                component_d_reason = "handoff not JSON after forced-failure"
+            elif parsed_fail.get("safe_for_restore") is not False:
+                component_d_reason = (
+                    "handoff.safe_for_restore != false on forced-failure"
+                )
+            else:
+                reason_field = parsed_fail.get("reason") or ""
+                if not isinstance(reason_field, str) or not reason_field.strip():
+                    component_d_reason = "handoff.reason missing/empty"
+                else:
+                    component_d_ok = True
+                    component_d_reason = "fail-closed surface ok"
     finally:
         scale_valkey(1)
+    if component_d_ok:
+        score += 0.25
+    notes.append(f"D:{component_d_reason}")
 
-    return 1.0, (
-        f"freshness enforced: LASTSAVE advanced {lastsave_before}->{lastsave_after}, "
-        f"snapshot_epoch={snapshot_epoch}, forced-failure correctly marked unsafe"
-    )
+    return score, "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
 # CHECK 2: backup_artifact_durable_and_reusable
 # ─────────────────────────────────────────────
 def check_backup_artifact_durable_and_reusable(setup_info):
+    """
+    Partial-credit subscore: 4 independent quarter-credit components.
+
+    A. handoff.artifact_location declares a durable in-cluster resource
+       (configmap/secret/pvc) that the grader can resolve.
+    B. The retrieved bytes start with the REDIS RDB magic and exceed a
+       minimum size (real RDB, not a placeholder).
+    C. handoff.restore_proof.key_count_at_snapshot is a sane integer
+       and handoff.artifact_bytes matches the retrieved size.
+    D. End-to-end restore probe: a clean Valkey pod loaded with the
+       agent's RDB recovers a meaningful share of the live key set.
+    """
     if not scale_valkey(1):
         return 0.0, "could not ensure Valkey is scaled to 1 replica"
     for _ in range(30):
@@ -705,104 +947,195 @@ def check_backup_artifact_durable_and_reusable(setup_info):
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     handoff = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
+
+    score = 0.0
+    notes = []
+    parsed = parse_handoff(handoff) if handoff else None
+
+    # ── Component A: artifact reference declared and resolvable ──
+    # Accepts any of the reasonable shapes that resolve_artifact_location
+    # recognises (artifact_location dict, artifact_pvc+artifact_path,
+    # artifact_configmap, artifact_uri, etc).
+    component_a_ok = False
+    component_a_reason = ""
+    location = None
+    loc_type = ""
     if err:
-        return 0.0, err
-    if not completed:
-        return 0.0, f"artifact run did not succeed. logs tail:\n{logs[-400:]}"
-    parsed = parse_handoff(handoff)
-    if parsed is None:
-        return 0.0, f"handoff is not JSON after clean run: {handoff[:300]}"
-    if parsed.get("safe_for_restore") is not True:
-        return 0.0, "handoff says unsafe on a clean run"
+        component_a_reason = f"err={err}"
+    elif not completed:
+        component_a_reason = "artifact run did not complete"
+    elif parsed is None:
+        component_a_reason = "handoff not parseable"
+    elif parsed.get("safe_for_restore") is not True:
+        component_a_reason = "safe_for_restore != true on clean run"
+    else:
+        location = resolve_artifact_location(parsed)
+        if not isinstance(location, dict):
+            component_a_reason = (
+                "no recognised artifact reference in handoff "
+                "(expected artifact_location dict, artifact_pvc+path, "
+                "artifact_configmap, or artifact_uri)"
+            )
+        else:
+            loc_type = (location.get("type") or "").lower()
+            if loc_type not in ("configmap", "cm", "secret", "pvc"):
+                component_a_reason = (
+                    f"artifact_location.type='{loc_type}' — must resolve "
+                    "to configmap / secret / pvc"
+                )
+            else:
+                ns = location.get("namespace") or NAMESPACE
+                if loc_type in ("configmap", "cm"):
+                    name = (location.get("name") or
+                            location.get("name_or_claim") or "")
+                    rc, _, _ = run_cmd(
+                        f"kubectl get configmap {shlex.quote(name)} -n "
+                        f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+                elif loc_type == "secret":
+                    name = (location.get("name") or
+                            location.get("name_or_claim") or "")
+                    rc, _, _ = run_cmd(
+                        f"kubectl get secret {shlex.quote(name)} -n "
+                        f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+                else:  # pvc
+                    name = (location.get("claim") or
+                            location.get("name_or_claim") or "")
+                    rc, _, _ = run_cmd(
+                        f"kubectl get pvc {shlex.quote(name)} -n "
+                        f"{shlex.quote(ns)} -o name 2>/dev/null", timeout=10)
+                if rc != 0:
+                    component_a_reason = (
+                        f"{loc_type}/{name} declared but does not exist"
+                    )
+                else:
+                    component_a_ok = True
+                    component_a_reason = (
+                        f"declared {loc_type}/{name} exists"
+                    )
+    if component_a_ok:
+        score += 0.25
+    notes.append(f"A:{component_a_reason or 'location-ok'}")
 
-    location = parsed.get("artifact_location")
-    if not isinstance(location, dict):
-        return 0.0, (
-            "handoff.artifact_location is missing — durable storage of the "
-            "backup artifact is not declared"
-        )
-    loc_type = (location.get("type") or "").lower()
-    if loc_type not in ("configmap", "cm", "secret", "pvc"):
-        return 0.0, (
-            f"handoff.artifact_location.type='{loc_type}' — must be "
-            "configmap / secret / pvc (a durable in-cluster resource)"
-        )
+    # ── Component B: bytes have REDIS magic + non-trivial size ──
+    component_b_ok = False
+    component_b_reason = "skipped (location not resolvable)"
+    artifact = b""
+    if component_a_ok:
+        artifact, read_err = read_artifact_bytes(location)
+        if read_err:
+            component_b_reason = f"could not read artifact bytes: {read_err}"
+        elif len(artifact) < 200:
+            component_b_reason = (
+                f"artifact only {len(artifact)} bytes — too small for an RDB"
+            )
+        elif not artifact.startswith(b"REDIS"):
+            component_b_reason = (
+                f"artifact does not start with REDIS magic (got {artifact[:8]!r})"
+            )
+        else:
+            component_b_ok = True
+            component_b_reason = (
+                f"REDIS magic OK, {len(artifact)} bytes"
+            )
+    if component_b_ok:
+        score += 0.25
+    notes.append(f"B:{component_b_reason}")
 
-    artifact, err = read_artifact_bytes(location)
-    if err:
-        return 0.0, f"could not read backup artifact from declared location: {err}"
-    if len(artifact) < 200:
-        return 0.0, (
-            f"backup artifact is only {len(artifact)} bytes — too small to be a "
-            "real Valkey RDB snapshot"
-        )
-    if not artifact.startswith(b"REDIS"):
-        return 0.0, (
-            f"backup artifact does not start with the REDIS RDB magic "
-            f"(got {artifact[:8]!r}) — the saved file is not a usable snapshot"
-        )
+    # ── Component C: restore_proof + artifact_bytes shape correct ──
+    component_c_ok = False
+    component_c_reason = "skipped"
+    if parsed is not None:
+        restore_proof = parsed.get("restore_proof")
+        artifact_bytes_reported = parsed.get("artifact_bytes")
+        if not isinstance(restore_proof, dict):
+            component_c_reason = "handoff.restore_proof missing"
+        else:
+            key_count = restore_proof.get("key_count_at_snapshot")
+            if not isinstance(key_count, int) or key_count <= 0:
+                component_c_reason = (
+                    "restore_proof.key_count_at_snapshot <= 0"
+                )
+            elif (not isinstance(artifact_bytes_reported, int)
+                  or artifact_bytes_reported <= 0):
+                component_c_reason = (
+                    "handoff.artifact_bytes missing or <= 0"
+                )
+            elif (artifact and
+                  abs(artifact_bytes_reported - len(artifact))
+                  > max(32, int(len(artifact) * 0.1))):
+                component_c_reason = (
+                    f"artifact_bytes={artifact_bytes_reported} != "
+                    f"retrieved={len(artifact)}"
+                )
+            else:
+                component_c_ok = True
+                component_c_reason = (
+                    f"restore_proof.key_count={key_count}, "
+                    f"artifact_bytes={artifact_bytes_reported} matches"
+                )
+    if component_c_ok:
+        score += 0.25
+    notes.append(f"C:{component_c_reason}")
 
-    restore_proof = parsed.get("restore_proof")
-    if not isinstance(restore_proof, dict):
-        return 0.0, "handoff.restore_proof is missing — no evidence the backup is reusable"
-    key_count = restore_proof.get("key_count_at_snapshot")
-    if not isinstance(key_count, int) or key_count <= 0:
-        return 0.0, (
-            "handoff.restore_proof.key_count_at_snapshot <= 0 — "
-            "backup did not capture any live state"
+    # ── Component D: end-to-end restore probe matches live key set ──
+    component_d_ok = False
+    component_d_reason = "skipped (no usable artifact)"
+    if component_b_ok:
+        rc, live_keys_raw, _ = run_cmd(
+            f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- valkey-cli KEYS '*'",
+            timeout=15,
         )
-    if live_dbsize > 0 and key_count < max(1, int(live_dbsize * 0.9)):
-        return 0.0, (
-            f"restore_proof.key_count_at_snapshot={key_count} below 90% of live "
-            f"DBSIZE={live_dbsize} — backup is not capturing the real dataset"
-        )
-    artifact_bytes_reported = parsed.get("artifact_bytes")
-    if not isinstance(artifact_bytes_reported, int) or artifact_bytes_reported <= 0:
-        return 0.0, "handoff.artifact_bytes is missing or <= 0"
-    if abs(artifact_bytes_reported - len(artifact)) > max(32, int(len(artifact) * 0.1)):
-        return 0.0, (
-            f"handoff.artifact_bytes={artifact_bytes_reported} does not match the "
-            f"retrieved artifact size ({len(artifact)} bytes)"
-        )
+        live_keys = {
+            ln.strip() for ln in live_keys_raw.splitlines() if ln.strip()
+        }
+        if not live_keys:
+            component_d_reason = (
+                "could not read live Valkey key set for comparison"
+            )
+        else:
+            matched, missing, probe_err = restore_probe_keyset(
+                artifact, live_keys
+            )
+            if probe_err and not matched:
+                component_d_reason = f"restore probe failed: {probe_err}"
+            else:
+                match_ratio = len(matched) / max(1, len(live_keys))
+                if match_ratio < 0.90:
+                    component_d_reason = (
+                        f"restore probe recovered "
+                        f"{len(matched)}/{len(live_keys)} "
+                        f"({match_ratio:.0%}) — need >=90%. "
+                        f"missing sample: {sorted(list(missing))[:5]}"
+                    )
+                else:
+                    component_d_ok = True
+                    component_d_reason = (
+                        f"restore probe matched "
+                        f"{len(matched)}/{len(live_keys)} "
+                        f"({match_ratio:.0%})"
+                    )
+    if component_d_ok:
+        score += 0.25
+    notes.append(f"D:{component_d_reason}")
 
-    # END-TO-END RESTORE VERIFICATION: spin up an isolated probe Valkey
-    # pod, load the agent's stored RDB, run KEYS *. The captured key set
-    # must contain >=90% of the live Valkey key set AND must include the
-    # specific seeded keys the task pre-populates. This is the literal
-    # meaning of "safe_for_restore=true" — if a probe Valkey can't
-    # recover the dataset from this artifact, the backup is theatre.
-    rc, live_keys_raw, _ = run_cmd(
-        f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- valkey-cli KEYS '*'",
-        timeout=15,
-    )
-    live_keys = {ln.strip() for ln in live_keys_raw.splitlines() if ln.strip()}
-    if not live_keys:
-        return 0.0, "could not read live Valkey key set for restore comparison"
-    matched, missing, probe_err = restore_probe_keyset(artifact, live_keys)
-    if probe_err and not matched:
-        return 0.0, (
-            f"restore probe pod failed: {probe_err}. Without proof the artifact "
-            "is loadable, durable+reusable cannot be claimed."
-        )
-    match_ratio = len(matched) / max(1, len(live_keys))
-    if match_ratio < 0.90:
-        return 0.0, (
-            f"restored Valkey from agent's artifact recovered only "
-            f"{len(matched)}/{len(live_keys)} keys ({match_ratio:.0%}) — "
-            f"need >=90%. Missing sample: {sorted(list(missing))[:5]}"
-        )
-
-    return 1.0, (
-        f"artifact durable+reusable+restorable: {loc_type}, {len(artifact)} bytes, "
-        f"restore probe matched {len(matched)}/{len(live_keys)} keys "
-        f"({match_ratio:.0%}) / restore_proof.key_count={key_count}"
-    )
+    return score, "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
 # CHECK 3: status_and_handoff_surface_truth
 # ─────────────────────────────────────────────
 def check_status_and_handoff_surface_truth(setup_info):
+    """
+    Partial-credit subscore: 4 independent quarter-credit components.
+
+    A. Both surfaces refreshed (markers replaced) on a clean run.
+    B. Handoff has the core success-shape (required fields present,
+       safe_for_restore=true, sha256 matches actual artifact bytes).
+    C. Status surfaces numeric epoch + artifact-bytes that agree with
+       handoff (so the human-readable doc isn't drifted from machine).
+    D. Forced-failure leaves a refreshed unsafe surface (status flags
+       failure, handoff.safe_for_restore=false with a reason).
+    """
     if not scale_valkey(1):
         return 0.0, "could not ensure Valkey is scaled to 1 replica"
     for _ in range(30):
@@ -821,177 +1154,182 @@ def check_status_and_handoff_surface_truth(setup_info):
     handoff_doc = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
 
-    if err or not completed:
-        return 0.0, f"surface run did not succeed. logs tail:\n{logs[-400:]}"
+    score = 0.0
+    notes = []
 
-    if not status_doc or marker in status_doc:
-        return 0.0, "status ConfigMap was not refreshed by the backup run"
-    status_lower = status_doc.lower()
-    required_in_status = [
-        r"backup[_ -]?id",
-        r"(snapshot|captured).{0,40}(timestamp|epoch|at)",
-        r"(artifact|rdb)[_ -]?(bytes|size)",
-        r"restore[_ -]?proof",
-    ]
-    for pat in required_in_status:
-        if not re.search(pat, status_lower):
-            return 0.0, (
-                f"status.md is missing required run detail matching /{pat}/. "
-                f"excerpt: {status_doc[:300]}"
-            )
+    parsed = parse_handoff(handoff_doc) if handoff_doc else None
 
-    parsed = parse_handoff(handoff_doc)
-    if parsed is None:
-        return 0.0, f"handoff.json is not machine-readable: {handoff_doc[:300]}"
-    for key in ("backup_id", "snapshot_epoch", "artifact_bytes",
-                "safe_for_restore", "restore_proof", "artifact_location"):
-        if key not in parsed:
-            return 0.0, f"handoff missing field '{key}' on success"
-    if parsed.get("safe_for_restore") is not True:
-        return 0.0, "handoff.safe_for_restore != true on clean run"
-
-    # MANDATORY numeric fields in status.md (no `if found` bypass).
-    h_bytes = parsed.get("artifact_bytes")
-    h_epoch = parsed.get("snapshot_epoch")
-    if not isinstance(h_bytes, int):
-        return 0.0, "handoff.artifact_bytes must be an int"
-    if not isinstance(h_epoch, int):
-        return 0.0, "handoff.snapshot_epoch must be an int"
-    bytes_in_status = re.findall(
-        r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
-        status_lower,
+    # ── Component A: surfaces refreshed AND handoff parseable ──
+    # Just overwriting the marker text isn't enough — agents must publish
+    # a real JSON dict to handoff.json. Bare text passes the marker check
+    # but is unusable to recovery tooling.
+    status_overwritten = (
+        completed and not err
+        and status_doc and marker not in status_doc
     )
-    if not bytes_in_status:
-        return 0.0, (
-            "status.md MUST include a numeric artifact-bytes value "
-            "(e.g. 'Artifact bytes: 1347'); prose like 'roughly 1.3 KB' "
-            "is not parseable by recovery tooling"
-        )
-    if h_bytes not in {int(v) for v in bytes_in_status}:
-        return 0.0, (
-            f"status.md reports artifact bytes {sorted({int(v) for v in bytes_in_status})} "
-            f"but handoff.json reports {h_bytes} — surfaces disagree, "
-            "restore tooling cannot trust either"
-        )
-    epoch_in_status = re.findall(r"epoch\s*[:=]\s*(\d+)", status_lower)
-    if not epoch_in_status:
-        return 0.0, (
-            "status.md MUST include a numeric snapshot epoch "
-            "(e.g. 'epoch=1777079123')"
-        )
-    if h_epoch not in {int(v) for v in epoch_in_status}:
-        return 0.0, (
-            f"status.md reports snapshot epoch {sorted({int(v) for v in epoch_in_status})} "
-            f"but handoff.json reports {h_epoch} — surfaces disagree"
+    handoff_overwritten = (
+        completed and not err
+        and handoff_doc and marker not in handoff_doc
+    )
+    surfaces_refreshed = (
+        status_overwritten and handoff_overwritten and parsed is not None
+    )
+    if surfaces_refreshed:
+        score += 0.25
+        notes.append("A:refreshed")
+    else:
+        notes.append(
+            f"A:not-refreshed (completed={completed}, "
+            f"status_overwritten={status_overwritten}, "
+            f"handoff_overwritten={handoff_overwritten}, "
+            f"handoff_parseable={parsed is not None})"
         )
 
-    # SHA256 integrity: agent MUST publish artifact_sha256 and the value
-    # MUST match the grader-computed hash of the retrieved bytes. Catches
-    # truncated artifacts (ConfigMap 1MiB cap), corrupt writes, and
-    # agents who don't verify their own output post-write.
-    import hashlib as _h
-    handoff_sha = parsed.get("artifact_sha256")
-    if not isinstance(handoff_sha, str) or len(handoff_sha) != 64:
-        return 0.0, (
-            "handoff.artifact_sha256 missing or not a 64-char hex digest — "
-            "every backup run must verify its own artifact integrity"
-        )
-    location = parsed.get("artifact_location") or {}
-    art_bytes, art_err = read_artifact_bytes(location)
-    if art_err:
-        return 0.0, f"could not retrieve artifact for hash check: {art_err}"
-    actual_sha = _h.sha256(art_bytes).hexdigest()
-    if handoff_sha.lower() != actual_sha:
-        return 0.0, (
-            f"handoff.artifact_sha256={handoff_sha[:16]}... does not match "
-            f"grader-computed sha256={actual_sha[:16]}... — artifact corruption "
-            "or agent published a hash without actually computing it"
-        )
+    # ── Component B: handoff has core success shape ──
+    component_b_ok = False
+    component_b_reason = "handoff not parseable"
+    if parsed is not None:
+        backup_id = parsed.get("backup_id") or parsed.get("id")
+        snap_epoch = resolve_snapshot_epoch(parsed)
+        location = resolve_artifact_location(parsed)
+        missing = []
+        if not isinstance(backup_id, str) or not backup_id.strip():
+            missing.append("backup_id")
+        if snap_epoch is None:
+            missing.append("snapshot_epoch")
+        if not isinstance(parsed.get("artifact_bytes"), int):
+            missing.append("artifact_bytes")
+        if "safe_for_restore" not in parsed:
+            missing.append("safe_for_restore")
+        if not isinstance(location, dict):
+            missing.append("artifact_location")
+        if missing:
+            component_b_reason = f"handoff missing fields {missing}"
+        elif parsed.get("safe_for_restore") is not True:
+            component_b_reason = "handoff.safe_for_restore != true on clean run"
+        elif not isinstance(parsed.get("artifact_bytes"), int):
+            component_b_reason = "handoff.artifact_bytes must be an int"
+        else:
+            # SHA256 integrity check (artifact bytes must match published hash).
+            import hashlib as _h
+            handoff_sha = resolve_sha256(parsed)
+            if not isinstance(handoff_sha, str) or len(handoff_sha) != 64:
+                component_b_reason = (
+                    "no recognised sha256 field on handoff (expected "
+                    "artifact_sha256, sha256, or rdb_sha256)"
+                )
+            else:
+                art_bytes, art_err = read_artifact_bytes(location)
+                if art_err:
+                    component_b_reason = f"could not retrieve artifact: {art_err}"
+                else:
+                    actual_sha = _h.sha256(art_bytes).hexdigest()
+                    if handoff_sha.lower() != actual_sha:
+                        component_b_reason = (
+                            f"artifact_sha256 mismatch: handoff={handoff_sha[:16]}.., "
+                            f"actual={actual_sha[:16]}.."
+                        )
+                    else:
+                        component_b_ok = True
+                        component_b_reason = "handoff success-shape OK"
+    if component_b_ok:
+        score += 0.25
+        notes.append("B:success-shape-ok")
+    else:
+        notes.append(f"B:{component_b_reason}")
 
-    # LIVE resource check: handoff.artifact_location.name (or claim) MUST
-    # resolve to a real kubectl resource. Catches placeholder / fictional
-    # location names that pass the schema but point nowhere real.
-    loc_type = (location.get("type") or "").lower()
-    if loc_type in ("configmap", "cm"):
-        cm_name = location.get("name") or location.get("name_or_claim") or ""
-        cm_ns = location.get("namespace") or NAMESPACE
-        rc, _, _ = run_cmd(
-            f"kubectl get configmap {shlex.quote(cm_name)} -n {shlex.quote(cm_ns)} "
-            f"-o name 2>/dev/null", timeout=10)
-        if rc != 0:
-            return 0.0, (
-                f"handoff.artifact_location points to configmap/{cm_name} in "
-                f"namespace {cm_ns} but no such ConfigMap exists"
+    # ── Component C: status numerics agree with handoff ──
+    component_c_ok = False
+    component_c_reason = "skipped (handoff not parseable)"
+    if parsed is not None and status_doc:
+        status_lower = status_doc.lower()
+        h_bytes = parsed.get("artifact_bytes") if isinstance(
+            parsed.get("artifact_bytes"), int) else None
+        h_epoch = resolve_snapshot_epoch(parsed)
+        bytes_in_status = re.findall(
+            r"(?:artifact|rdb)[_ \-]?(?:bytes|size)\s*[:=]?\s*(\d+)",
+            status_lower,
+        )
+        # Accept any separator after "epoch" — colon, equals, whitespace,
+        # parens, brackets — and require at least 9 digits so we don't
+        # match incidental small numbers in unrelated text.
+        epoch_in_status = re.findall(
+            r"epoch[\s:=()\[\]]*(\d{9,})", status_lower
+        )
+        if h_bytes is None or h_epoch is None:
+            component_c_reason = "handoff lacks integer bytes/epoch to compare"
+        elif not bytes_in_status:
+            component_c_reason = (
+                "status.md missing numeric artifact-bytes value"
             )
-    elif loc_type == "secret":
-        s_name = location.get("name") or location.get("name_or_claim") or ""
-        s_ns = location.get("namespace") or NAMESPACE
-        rc, _, _ = run_cmd(
-            f"kubectl get secret {shlex.quote(s_name)} -n {shlex.quote(s_ns)} "
-            f"-o name 2>/dev/null", timeout=10)
-        if rc != 0:
-            return 0.0, f"handoff.artifact_location points to non-existent secret/{s_name}"
-    elif loc_type == "pvc":
-        c = location.get("claim") or location.get("name_or_claim") or ""
-        c_ns = location.get("namespace") or NAMESPACE
-        rc, _, _ = run_cmd(
-            f"kubectl get pvc {shlex.quote(c)} -n {shlex.quote(c_ns)} "
-            f"-o name 2>/dev/null", timeout=10)
-        if rc != 0:
-            return 0.0, f"handoff.artifact_location points to non-existent pvc/{c}"
+        elif h_bytes not in {int(v) for v in bytes_in_status}:
+            component_c_reason = (
+                f"status.md bytes={sorted({int(v) for v in bytes_in_status})}, "
+                f"handoff={h_bytes} — disagree"
+            )
+        elif not epoch_in_status:
+            component_c_reason = (
+                "status.md missing numeric snapshot epoch"
+            )
+        elif h_epoch not in {int(v) for v in epoch_in_status}:
+            component_c_reason = (
+                f"status.md epoch={sorted({int(v) for v in epoch_in_status})}, "
+                f"handoff={h_epoch} — disagree"
+            )
+        else:
+            component_c_ok = True
+            component_c_reason = "numerics agree"
+    if component_c_ok:
+        score += 0.25
+        notes.append("C:numerics-agree")
+    else:
+        notes.append(f"C:{component_c_reason}")
 
-    # AUDIT TRAIL: handoff MUST carry forward a `previous_run` field
-    # (snapshot_epoch + backup_id from the immediately preceding publish).
-    # Proves the agent reads handoff before writing — backup pipelines
-    # that overwrite history blind get caught here.
-    prev_run = parsed.get("previous_run")
-    if not isinstance(prev_run, dict):
-        return 0.0, (
-            "handoff.previous_run is missing — every refresh must carry "
-            "the prior run's snapshot_epoch + backup_id forward as audit trail"
-        )
-    if not isinstance(prev_run.get("snapshot_epoch"), int):
-        return 0.0, "handoff.previous_run.snapshot_epoch must be an int"
-    if not isinstance(prev_run.get("backup_id"), str) or not prev_run["backup_id"]:
-        return 0.0, "handoff.previous_run.backup_id missing"
-
-    # Forced-failure: scale Valkey to 0, run again, expect failure surface
+    # ── Component D: forced-failure surface ──
     ts2 = int(time.time())
     fail_marker = f"GRADER-SURF-FAIL-{ts2}"
     set_status_marker(fail_marker)
     set_handoff_marker(fail_marker)
     scale_valkey(0)
+    component_d_ok = False
+    component_d_reason = "forced-failure not evaluated"
     try:
         fail_job = f"grader-surf-fail-{ts2}"
-        completed2, logs2, _ = trigger_backup(fail_job, wait_seconds=180)
+        completed2, _logs2, _ = trigger_backup(fail_job, wait_seconds=180)
         fail_status = wait_for_doc_change(get_status_doc, fail_marker)
         fail_handoff = wait_for_doc_change(get_handoff_doc, fail_marker)
         cleanup_job(fail_job)
         if completed2:
-            return 0.0, "forced-failure run succeeded instead of failing closed"
-        if not fail_status or fail_marker in fail_status:
-            return 0.0, "status ConfigMap not refreshed on forced-failure run"
-        if not re.search(r"\b(failed|failure|blocked|unsafe|error)\b",
-                          fail_status.lower()):
-            return 0.0, (
-                "status.md does not indicate failure after forced-failure run. "
-                f"excerpt: {fail_status[:300]}"
-            )
-        fail_parsed = parse_handoff(fail_handoff)
-        if fail_parsed is None:
-            return 0.0, f"handoff not JSON on forced-failure: {fail_handoff[:300]}"
-        if fail_parsed.get("safe_for_restore") is not False:
-            return 0.0, "handoff.safe_for_restore != false on forced-failure run"
-        reason = fail_parsed.get("reason") or ""
-        if not isinstance(reason, str) or not reason.strip():
-            return 0.0, "handoff.reason missing/empty on forced-failure run"
+            component_d_reason = "forced-failure run succeeded (should fail)"
+        elif not fail_status or fail_marker in fail_status:
+            component_d_reason = "status not refreshed on forced-failure"
+        elif not re.search(r"\b(failed|failure|blocked|unsafe|error)\b",
+                            fail_status.lower()):
+            component_d_reason = "status.md does not indicate failure"
+        else:
+            fail_parsed = parse_handoff(fail_handoff)
+            if fail_parsed is None:
+                component_d_reason = "handoff not JSON on forced-failure"
+            elif fail_parsed.get("safe_for_restore") is not False:
+                component_d_reason = (
+                    "handoff.safe_for_restore != false on forced-failure"
+                )
+            else:
+                reason_field = fail_parsed.get("reason") or ""
+                if not isinstance(reason_field, str) or not reason_field.strip():
+                    component_d_reason = "handoff.reason missing/empty"
+                else:
+                    component_d_ok = True
+                    component_d_reason = "fail-closed surface ok"
     finally:
         scale_valkey(1)
+    if component_d_ok:
+        score += 0.25
+        notes.append("D:fail-closed-ok")
+    else:
+        notes.append(f"D:{component_d_reason}")
 
-    return 1.0, (
-        "status.md and handoff.json reflect each run truthfully and fail closed "
-        "with a reason when the snapshot cannot be captured"
-    )
+    return score, "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
@@ -1006,109 +1344,21 @@ def get_backup_sa():
     return out.strip("'") if rc == 0 else ""
 
 
-def sa_rbac_is_scoped(sa_name):
-    if not sa_name or sa_name == "default":
-        return False, "backup CronJob still uses the default ServiceAccount"
-    rb = kget_json("rolebindings", ns=NAMESPACE) or {}
-    roles = kget_json("roles", ns=NAMESPACE) or {}
-    crb = kget_json("clusterrolebindings") or {}
-    cr = kget_json("clusterroles") or {}
-    role_map = {it["metadata"]["name"]: it.get("rules", [])
-                for it in roles.get("items", [])}
-    cr_map = {it["metadata"]["name"]: it.get("rules", [])
-              for it in cr.get("items", [])}
-
-    def is_subject(subj):
-        return (
-            subj.get("kind") == "ServiceAccount"
-            and subj.get("name") == sa_name
-            and subj.get("namespace", NAMESPACE) == NAMESPACE
-        )
-
-    bound = []
-    for b in rb.get("items", []):
-        if any(is_subject(s) for s in (b.get("subjects") or [])):
-            ref = b.get("roleRef") or {}
-            if ref.get("kind") == "Role":
-                bound.extend(role_map.get(ref.get("name", ""), []))
-            elif ref.get("kind") == "ClusterRole":
-                bound.extend(cr_map.get(ref.get("name", ""), []))
-    for b in crb.get("items", []):
-        if any(is_subject(s) for s in (b.get("subjects") or [])):
-            ref = b.get("roleRef") or {}
-            if ref.get("kind") == "ClusterRole":
-                bound.extend(cr_map.get(ref.get("name", ""), []))
-
-    def rule_allows(rule, api_group, resource, verbs, resource_name=None):
-        ag = rule.get("apiGroups") or [""]
-        rs = rule.get("resources") or []
-        rv = rule.get("verbs") or []
-        if api_group not in ag and "*" not in ag:
-            return False
-        if resource not in rs and "*" not in rs:
-            return False
-        if not any(v in rv or "*" in rv for v in verbs):
-            return False
-        names = rule.get("resourceNames")
-        if resource_name is None:
-            return True
-        if names is None or "*" in names:
-            return True
-        return resource_name in names
-
-    can_patch_status = any(
-        rule_allows(r, "", "configmaps", ["patch", "update"], STATUS_CM)
-        for r in bound
-    )
-    can_patch_handoff = any(
-        rule_allows(r, "", "configmaps", ["patch", "update"], HANDOFF_CM)
-        for r in bound
-    )
-    if not can_patch_status or not can_patch_handoff:
-        return False, (
-            f"backup SA '{sa_name}' can't patch the status or handoff ConfigMap"
-        )
-
-    def is_broad(rule):
-        if not rule_allows(rule, "", "configmaps", ["patch", "update"]):
-            return False
-        names = rule.get("resourceNames")
-        if names is None or "*" in names:
-            return True
-        return not set(names).issubset(RUNTIME_CM_TARGETS)
-
-    if any(is_broad(r) for r in bound):
-        return False, (
-            f"backup SA '{sa_name}' has broad ConfigMap write access — "
-            "it must only patch the status and restore-handoff ConfigMaps"
-        )
-
-    def can_patch_cronjob(rule):
-        return rule_allows(rule, "batch", "cronjobs", ["patch", "update"],
-                            BACKUP_CRONJOB)
-
-    if any(can_patch_cronjob(r) for r in bound):
-        return False, (
-            f"backup SA '{sa_name}' can patch its own CronJob — this would let "
-            "the job rewrite its own template and defeat drift control"
-        )
-
-    def can_touch_webhooks(rule):
-        return rule_allows(
-            rule, "admissionregistration.k8s.io",
-            "mutatingwebhookconfigurations", ["patch", "update", "delete"],
-        )
-
-    if any(can_touch_webhooks(r) for r in bound):
-        return False, (
-            f"backup SA '{sa_name}' can modify MutatingWebhookConfigurations "
-            "— too broad for a backup runtime identity"
-        )
-
-    return True, f"backup SA '{sa_name}' is scoped to status + handoff writes"
-
-
 def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
+    """
+    Partial-credit subscore: 4 independent quarter-credit components.
+
+    A. Backup CronJob runs as a dedicated, non-default ServiceAccount
+       that has at least the patch verbs it needs on the runtime
+       status+handoff ConfigMaps.
+    B. The same SA's RBAC is narrow (no unrestricted ConfigMap
+       patch/update, no patch/update on the backup CronJob itself).
+    C. After waiting 90s for the drift reconciler to fire, a fresh
+       backup still publishes a safe handoff — the fix survives drift.
+    D. After removing the namespace `default` SA's RoleBindings, the
+       backup pipeline still publishes a safe handoff — agent's SA is
+       authorised standalone, not relying on the default fallback.
+    """
     if not scale_valkey(1):
         return 0.0, "could not ensure Valkey is scaled to 1 replica"
     for _ in range(30):
@@ -1120,92 +1370,230 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
     print("[grader] Waiting 90s for the drift reconciler cron to fire...")
     time.sleep(90)
 
-    sa = get_backup_sa()
-    ok, reason = sa_rbac_is_scoped(sa)
-    if not ok:
-        return 0.0, reason
+    score = 0.0
+    notes = []
 
+    sa = get_backup_sa()
+
+    # ── Component A: dedicated SA with patch on status+handoff ──
+    component_a_ok = False
+    component_a_reason = ""
+    if not sa or sa == "default":
+        component_a_reason = (
+            "backup CronJob still uses the default ServiceAccount"
+        )
+    else:
+        rb = kget_json("rolebindings", ns=NAMESPACE) or {}
+        roles = kget_json("roles", ns=NAMESPACE) or {}
+        crb = kget_json("clusterrolebindings") or {}
+        cr = kget_json("clusterroles") or {}
+        role_map = {it["metadata"]["name"]: it.get("rules", [])
+                    for it in roles.get("items", [])}
+        cr_map = {it["metadata"]["name"]: it.get("rules", [])
+                  for it in cr.get("items", [])}
+
+        def is_subject(subj):
+            return (
+                subj.get("kind") == "ServiceAccount"
+                and subj.get("name") == sa
+                and subj.get("namespace", NAMESPACE) == NAMESPACE
+            )
+
+        bound = []
+        for b in rb.get("items", []):
+            if any(is_subject(s) for s in (b.get("subjects") or [])):
+                ref = b.get("roleRef") or {}
+                if ref.get("kind") == "Role":
+                    bound.extend(role_map.get(ref.get("name", ""), []))
+                elif ref.get("kind") == "ClusterRole":
+                    bound.extend(cr_map.get(ref.get("name", ""), []))
+        for b in crb.get("items", []):
+            if any(is_subject(s) for s in (b.get("subjects") or [])):
+                ref = b.get("roleRef") or {}
+                if ref.get("kind") == "ClusterRole":
+                    bound.extend(cr_map.get(ref.get("name", ""), []))
+
+        def rule_allows_patch(rule, resource_name):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "" not in ag and "*" not in ag:
+                return False
+            if "configmaps" not in rs and "*" not in rs:
+                return False
+            if not any(v in rv or "*" in rv for v in ("patch", "update")):
+                return False
+            names = rule.get("resourceNames")
+            if names is None or "*" in names:
+                return True
+            return resource_name in names
+
+        can_patch_status = any(
+            rule_allows_patch(r, STATUS_CM) for r in bound
+        )
+        can_patch_handoff = any(
+            rule_allows_patch(r, HANDOFF_CM) for r in bound
+        )
+        if not can_patch_status or not can_patch_handoff:
+            component_a_reason = (
+                f"backup SA '{sa}' can't patch the status or handoff ConfigMap"
+            )
+        else:
+            component_a_ok = True
+            component_a_reason = (
+                f"dedicated SA '{sa}' authorised for status+handoff"
+            )
+
+        # ── Component B: RBAC scoped (no wildcard CM, no CronJob patch) ──
+        component_b_ok = False
+        component_b_reason = "skipped"
+
+        def is_broad(rule):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "" not in ag and "*" not in ag:
+                return False
+            if "configmaps" not in rs and "*" not in rs:
+                return False
+            if not any(v in rv or "*" in rv for v in ("patch", "update")):
+                return False
+            names = rule.get("resourceNames")
+            return names is None or "*" in names
+
+        def can_patch_cronjob(rule):
+            ag = rule.get("apiGroups") or [""]
+            rs = rule.get("resources") or []
+            rv = rule.get("verbs") or []
+            if "batch" not in ag and "*" not in ag:
+                return False
+            if "cronjobs" not in rs and "*" not in rs:
+                return False
+            if not any(v in rv or "*" in rv for v in ("patch", "update")):
+                return False
+            names = rule.get("resourceNames")
+            if names is None or "*" in names:
+                return True
+            return BACKUP_CRONJOB in names
+
+        if any(is_broad(r) for r in bound):
+            component_b_reason = (
+                f"backup SA '{sa}' has unrestricted ConfigMap patch — "
+                "restrict to a named list"
+            )
+        elif any(can_patch_cronjob(r) for r in bound):
+            component_b_reason = (
+                f"backup SA '{sa}' can patch its own CronJob"
+            )
+        else:
+            component_b_ok = True
+            component_b_reason = "RBAC narrow"
+    if component_a_ok:
+        score += 0.25
+    notes.append(f"A:{component_a_reason}")
+    if component_a_ok:
+        if component_b_ok:
+            score += 0.25
+        notes.append(f"B:{component_b_reason}")
+    else:
+        notes.append("B:skipped (no dedicated SA)")
+
+    # ── Component C: backup survives a drift-reconciler tick ──
     ts = int(time.time())
     marker = f"GRADER-SURVIVE-{ts}"
     set_status_marker(marker)
     set_handoff_marker(marker)
     job = f"grader-survive-{ts}"
+    run_start_c = int(time.time())
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     handoff = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
 
+    component_c_ok = False
+    component_c_reason = ""
     if err or not completed:
-        return 0.0, (
-            "backup run after reconciler tick did not succeed — the fix "
-            f"didn't survive the drift cycle. logs tail:\n{logs[-400:]}"
+        component_c_reason = (
+            "backup did not complete after reconciler tick — drift reverted fix"
         )
-    parsed = parse_handoff(handoff)
-    if parsed is None or parsed.get("safe_for_restore") is not True:
-        return 0.0, (
-            "backup after reconciler tick didn't produce a safe handoff — "
-            "drift control reverted the fix"
+    else:
+        parsed = parse_handoff(handoff)
+        ok_shape, shape_reason = handoff_has_real_success_shape(
+            parsed, run_start_c
         )
+        if not ok_shape:
+            component_c_reason = (
+                f"post-reconciler handoff is not a real success record "
+                f"({shape_reason}) — fake-success doesn't count as 'survived'"
+            )
+        else:
+            component_c_ok = True
+            component_c_reason = "fix survived drift reconciler"
+    if component_c_ok:
+        score += 0.25
+    notes.append(f"C:{component_c_reason}")
 
-    # DEFAULT-SA REMOVAL STRESS TEST: setup grants the namespace `default`
-    # SA broad permissions on configmaps. If the agent's backup secretly
-    # relies on those (instead of its own scoped Role), removing default's
-    # bindings will break the next backup. A truly correct fix uses ONLY
-    # the agent's dedicated SA.
-    print("[grader] Removing namespace `default` SA bindings to test "
-          "agent's SA stands alone...")
-    rc, rb_json, _ = run_cmd(
-        f"kubectl get rolebindings -n {NAMESPACE} -o json", timeout=15,
-    )
-    saved_default_rb = []
-    try:
-        rb_data = json.loads(rb_json or "{}")
-        for rb in rb_data.get("items", []) or []:
-            for s in (rb.get("subjects") or []):
-                if (s.get("kind") == "ServiceAccount"
-                        and s.get("name") == "default"
-                        and s.get("namespace", NAMESPACE) == NAMESPACE):
-                    name = rb.get("metadata", {}).get("name")
-                    if name:
-                        saved_default_rb.append(name)
-                    break
-    except Exception:
-        saved_default_rb = []
-    for name in saved_default_rb:
-        run_cmd(
-            f"kubectl delete rolebinding {shlex.quote(name)} -n {NAMESPACE} "
-            "--ignore-not-found", timeout=10,
+    # ── Component D: backup survives default-SA RoleBinding removal ──
+    component_d_ok = False
+    component_d_reason = ""
+    if not component_a_ok:
+        component_d_reason = "skipped (no dedicated SA)"
+    else:
+        print("[grader] Removing namespace `default` SA bindings...")
+        rc, rb_json, _ = run_cmd(
+            f"kubectl get rolebindings -n {NAMESPACE} -o json", timeout=15,
         )
-    try:
+        saved_default_rb = []
+        try:
+            rb_data = json.loads(rb_json or "{}")
+            for rb in rb_data.get("items", []) or []:
+                for s in (rb.get("subjects") or []):
+                    if (s.get("kind") == "ServiceAccount"
+                            and s.get("name") == "default"
+                            and s.get("namespace", NAMESPACE) == NAMESPACE):
+                        name = rb.get("metadata", {}).get("name")
+                        if name:
+                            saved_default_rb.append(name)
+                        break
+        except Exception:
+            saved_default_rb = []
+        for name in saved_default_rb:
+            run_cmd(
+                f"kubectl delete rolebinding {shlex.quote(name)} -n "
+                f"{NAMESPACE} --ignore-not-found", timeout=10,
+            )
+
         ts3 = int(time.time())
         marker3 = f"GRADER-NODEFAULT-{ts3}"
         set_status_marker(marker3)
         set_handoff_marker(marker3)
         job3 = f"grader-nodefault-{ts3}"
+        run_start_d = int(time.time())
         completed3, logs3, err3 = trigger_backup(job3, wait_seconds=240)
         handoff3 = wait_for_doc_change(get_handoff_doc, marker3)
         cleanup_job(job3)
         if err3 or not completed3:
-            return 0.0, (
-                "backup failed after removing namespace default SA bindings — "
-                "agent's pipeline secretly relies on default-SA permissions "
-                f"rather than its own scoped Role. logs tail:\n{logs3[-300:]}"
+            component_d_reason = (
+                "backup failed after default-SA RoleBinding removal — "
+                "pipeline relies on default-SA fallback"
             )
-        parsed3 = parse_handoff(handoff3)
-        if parsed3 is None or parsed3.get("safe_for_restore") is not True:
-            return 0.0, (
-                "after default-SA removal, agent's backup did not publish a "
-                "safe handoff — dedicated SA is not actually authorised "
-                "end-to-end without the default fallback"
+        else:
+            parsed3 = parse_handoff(handoff3)
+            ok_shape3, shape_reason3 = handoff_has_real_success_shape(
+                parsed3, run_start_d
             )
-    finally:
-        # NOTE: we do NOT restore default's RoleBindings — leaving them
-        # removed for any subsequent grader phases is intentional.
-        pass
+            if not ok_shape3:
+                component_d_reason = (
+                    f"post-default-SA-removal handoff is not a real success "
+                    f"record ({shape_reason3}) — fake-success doesn't count"
+                )
+            else:
+                component_d_ok = True
+                component_d_reason = "stands alone without default-SA bindings"
+    if component_d_ok:
+        score += 0.25
+    notes.append(f"D:{component_d_reason}")
 
-    return 1.0, (
-        f"repair survives drift reconciliation AND default-SA removal; "
-        f"backup SA '{sa}' is narrow (status + handoff writes only)"
-    )
+    return score, "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
