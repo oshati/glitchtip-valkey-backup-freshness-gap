@@ -464,21 +464,43 @@ def _verify_handoff_signature(parsed):
         return False, f"public_key is {len(pk)}B (must be raw 32-byte Ed25519 key)", None
     if len(sig) != 64:
         return False, f"sig is {len(sig)}B (must be raw 64-byte Ed25519 signature)", None
+    # Verify via openssl subprocess — the apex_arena base image's
+    # python doesn't ship `cryptography`'s _cffi_backend, but openssl
+    # 3.x with Ed25519 support is on PATH. Wrap raw 32-byte pubkey in
+    # the 12-byte Ed25519 SubjectPublicKeyInfo DER prefix to feed it to
+    # `openssl pkeyutl -verify -pubin -keyform DER`.
+    import os as _os
+    import tempfile as _tf
+    tmpdir = _tf.mkdtemp(prefix="grader-ed25519-")
     try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PublicKey,
+        pub_der = bytes.fromhex("302a300506032b6570032100") + pk
+        pk_path = _os.path.join(tmpdir, "pub.der")
+        sig_path = _os.path.join(tmpdir, "sig.bin")
+        canon_path = _os.path.join(tmpdir, "canon.bin")
+        with open(pk_path, "wb") as f:
+            f.write(pub_der)
+        with open(sig_path, "wb") as f:
+            f.write(sig)
+        with open(canon_path, "wb") as f:
+            f.write(_canonical_handoff_payload(parsed))
+        rc, out, err = run_cmd(
+            f"openssl pkeyutl -verify -pubin -inkey {pk_path} "
+            f"-keyform DER -rawin -in {canon_path} -sigfile {sig_path} 2>&1",
+            timeout=15,
         )
-        from cryptography.exceptions import InvalidSignature
-    except ImportError:
-        return False, "cryptography lib not available in grader env", None
-    try:
-        Ed25519PublicKey.from_public_bytes(pk).verify(
-            sig, _canonical_handoff_payload(parsed)
-        )
-    except InvalidSignature:
-        return False, "Ed25519 signature does NOT verify against canonical payload", None
-    except Exception as e:
-        return False, f"signature verification error: {e}", None
+        combined = (out + " " + err).lower()
+        if rc != 0 or "successful" not in combined:
+            return False, (
+                f"Ed25519 signature does NOT verify against canonical "
+                f"payload (openssl rc={rc}, out={out[:120]!r})"
+            ), None
+    finally:
+        try:
+            for f in _os.listdir(tmpdir):
+                _os.unlink(_os.path.join(tmpdir, f))
+            _os.rmdir(tmpdir)
+        except Exception:
+            pass
     fingerprint = _h.sha256(pk).hexdigest()
     rc, fps_data, _ = run_cmd(
         f"kubectl get configmap {TRUST_ANCHOR_CM} -n {NAMESPACE} "
