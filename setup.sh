@@ -121,9 +121,14 @@ data:
     repl-diskless-sync-delay 0
   startup.sh: |
     #!/bin/sh
-    # Pod ordinal is the trailing integer of the hostname.
-    ORD="${HOSTNAME##*-}"
+    # Pod ordinal is the trailing integer of the hostname. Use the
+    # `hostname` command (not $HOSTNAME — busybox sh does not auto-set
+    # that variable the way bash does, which would make every pod fall
+    # through to the replica branch and present as a slave).
+    HOST="$(hostname)"
+    ORD="${HOST##*-}"
     MASTER_HOST="valkey-runtime-state-0.valkey-runtime-state.glitchtip.svc.cluster.local"
+    echo "[startup] hostname=${HOST} ord=${ORD}"
     if [ "${ORD}" = "0" ]; then
       echo "[startup] role=master (ord=0)"
       exec valkey-server /config/valkey.conf
