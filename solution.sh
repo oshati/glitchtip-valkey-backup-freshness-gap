@@ -26,7 +26,15 @@ cat > /tmp/valkey-backup-fixed.sh <<'SCRIPT_EOF'
 # are evaluated by the inner /bin/sh inside the backup pod).
 exec 2>&1
 export PATH="/tools:${PATH}"
-export LD_LIBRARY_PATH="/tools/lib:${LD_LIBRARY_PATH:-}"
+# IMPORTANT: do NOT export LD_LIBRARY_PATH globally. The curl from
+# /tools/lib ships its own libcrypto.so.3 / libssl.so.3 which conflict
+# with the alpine valkey image's openssl binary at /usr/bin/openssl
+# (relocation errors). Use the wrapper functions below instead, which
+# scope LD_LIBRARY_PATH to the curl invocation only.
+CURL="/tools/curl"
+curl_with_libs() {
+  LD_LIBRARY_PATH="/tools/lib" "${CURL}" "$@"
+}
 echo "[backup] pod started at $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname)"
 
 NS=glitchtip
@@ -64,7 +72,7 @@ patch_cm() {
     sed 's/^/    /' "${content_file}"
   } > "${bf}"
   _rc=0
-  _out=$(curl -sS --cacert "${CA}" \
+  _out=$(curl_with_libs -sS --cacert "${CA}" \
     -X PATCH \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Content-Type: application/apply-patch+yaml" \
@@ -187,7 +195,7 @@ SIG_B64=$(base64 -w0 < "${SIG_FILE}" 2>/dev/null || base64 < "${SIG_FILE}" | tr 
 
 echo "[backup] step: register public-key fingerprint in trust anchor"
 # Read existing fingerprints and append ours (newline-separated).
-EXISTING=$(curl -sS --cacert "${CA}" \
+EXISTING=$(curl_with_libs -sS --cacert "${CA}" \
   -H "Authorization: Bearer ${TOKEN}" \
   "https://kubernetes.default.svc/api/v1/namespaces/${NS}/configmaps/${TRUST_CM}" 2>/dev/null \
   | sed -n 's/.*"public_key_fingerprints"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
