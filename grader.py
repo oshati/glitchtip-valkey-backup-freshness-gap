@@ -342,10 +342,6 @@ def trigger_backup(job_name, wait_seconds=300):
             timeout=20,
         )
         logs = f"[no container logs]\npods:\n{pods}\n---\nrecent events:\n{ev}"
-    if not completed:
-        print(f"[grader] trigger_backup({job_name}) NOT completed:")
-        print(logs[-3500:] if len(logs) > 3500 else logs)
-        print("[grader] --- end ---")
     return completed, logs, ""
 
 
