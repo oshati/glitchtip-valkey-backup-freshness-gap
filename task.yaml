@@ -1,58 +1,106 @@
 id: glitchtip-valkey-backup-freshness-gap
 prompt: |
   [Context]
-  The platform team reran the GlitchTip recovery drill after a rough week of
-  incident noise, and the uncomfortable finding this time was not the database
-  dump or the attachment archive. Those existed.
+  The cluster is air-gapped. There is no internet egress; only images
+  already loaded into the local image store may be used. Standard cluster
+  utilities (kubectl, valkey-cli, redis-cli, psql, sha256sum, base64,
+  python3) and any images already pulled into the cluster are available.
+
+  The platform team reran the GlitchTip recovery drill after a rough week
+  of incident noise, and the uncomfortable finding this time was not the
+  database dump or the attachment archive. Those existed.
 
   The bad surprise was that the restored runtime state backed by Valkey was
-  clearly older than the point when the backup job claimed success. Recent mute
-  state, throttling data, and other short-horizon coordination state that
-  operators expected to survive the drill did not line up with the moment the
-  backup was supposedly taken.
+  clearly older than the point when the backup job claimed success. Recent
+  mute state, throttling data, and other short-horizon coordination state
+  that operators expected to survive the drill did not line up with the
+  moment the backup was supposedly taken.
 
-  This means the current pipeline is giving people the wrong kind of confidence:
-  it can produce a green-looking run record even when the Valkey portion is
-  stale, not freshly snapshotted, or not realistically reusable for recovery.
+  The current pipeline is giving people the wrong kind of confidence: it
+  can produce a green-looking run record even when the Valkey portion is
+  stale, not freshly snapshotted, or not realistically reusable for
+  recovery.
 
   [TASK]
-  Investigate the existing backup flow in the `glitchtip` namespace and make
-  the Valkey portion trustworthy again.
+  Investigate the existing backup flow in the `glitchtip` namespace and
+  make the Valkey portion trustworthy again.
 
-  A healthy run should only report success after it has actually captured a
-  fresh Valkey backup artifact and left that artifact somewhere durable in the
-  cluster. A bad run should stop itself instead of quietly publishing a green
-  record based on stale state or pod-local scratch output.
+  A healthy run should only report success after it has actually captured
+  a fresh Valkey backup artifact and left that artifact somewhere durable
+  in the cluster. A bad run should stop itself instead of quietly
+  publishing a green record based on stale state or pod-local scratch
+  output.
 
-  There is already a human-readable run note and a machine-readable restore
-  handoff somewhere in the cluster, but on-call cannot trust either one right
-  now. Refresh both of them from the latest run without requiring someone to
-  open pod logs. Failed runs should clearly mark restore as unsafe. Successful
-  runs should include concrete details showing that a real backup artifact was
-  produced and that it is current enough to use for recovery.
+  There is already a human-readable run note and a machine-readable
+  restore handoff in the cluster, but on-call cannot trust either one
+  right now. Refresh both of them from the latest run without requiring
+  someone to open pod logs. Failed runs should clearly mark restore as
+  unsafe. Successful runs should include concrete details showing that a
+  real backup artifact was produced and that it is current enough to use
+  for recovery — including evidence the consumer can use to detect later
+  tampering.
 
-  Recovery tooling will be hard on the artifact: it will load the captured
-  RDB into a clean Valkey instance and verify the key set comes back. So a
-  "successful" backup whose stored bytes can't actually be restored is the
-  exact failure mode operators are trying to catch this round. The handoff
-  needs to be self-verifying — every restore consumer on this platform reads
-  a sha256 from it and refuses to load any artifact whose retrieved hash
-  disagrees. The handoff must also carry a small audit trail forward (the
-  prior publish's epoch + id) so recovery can reason about the chain of
-  runs, not just the latest entry in isolation.
+  Recovery tooling will be hard on the artifact: it will load the
+  captured RDB into a clean Valkey instance and verify the key set comes
+  back. So a "successful" backup whose stored bytes can't actually be
+  restored is the exact failure mode operators are trying to catch this
+  round.
 
-  Do not solve this by hand-editing live Valkey data, disabling the guardrails,
-  or broadening access just to force a green result. The point is to make the
-  pipeline tell the truth about what it captured and preserve a backup that
-  downstream recovery tooling can actually use.
+  Note on Valkey snapshot mechanics: in this Valkey version, simply
+  reading the RDB stream off a connection does not by itself advance the
+  on-disk snapshot timestamp; getting a genuinely new snapshot requires
+  explicitly asking Valkey to take one and waiting for it to land. Any
+  freshness claim the backup makes has to be backed by a snapshot that
+  really happened during the run.
 
-  A few earlier fixes looked fine for one run and then quietly drifted back
-  after the surrounding backup automation reconciled itself, so make sure the
-  repair survives the current job-management flow instead of only working once.
-  The platform standard requires the backup CronJob to authenticate with its
-  own narrowly-scoped ServiceAccount that does not depend on permissions
-  granted to the namespace's `default` SA — recovery audits routinely revoke
-  default-SA access and a real fix must keep working when that happens.
+  Do not solve this by hand-editing live Valkey data, disabling the
+  guardrails, or broadening access just to force a green result. The
+  point is to make the pipeline tell the truth about what it captured
+  and preserve a backup that downstream recovery tooling can actually
+  use.
+
+  Backup runtime identity should be a dedicated, scoped service account
+  in the `glitchtip` namespace; the namespace's `default` identity has
+  historical bindings that should not be relied on for the backup
+  pipeline to succeed. Scoped means the backup identity is allowed to
+  refresh the two runtime status surfaces and to create the artifact
+  object, and nothing more — in particular it should not be granted
+  patch/update on its own CronJob or unrestricted write across all
+  ConfigMaps in the namespace.
+
+  The tamper-evidence the consumer relies on is a content hash of the
+  artifact bytes (sha256), published in the same handoff record that
+  declares the artifact location.
+
+  Handoff record contract. The machine-readable handoff is JSON consumed
+  by recovery tooling and must use these field names so the consumer
+  doesn't have to guess. A successful run publishes:
+    - safe_for_restore: true (boolean)
+    - backup_id: string identifier for the run
+    - snapshot_epoch: integer Unix epoch of the Valkey snapshot
+      (LASTSAVE after the run)
+    - artifact_bytes: integer size of the captured RDB
+    - artifact_sha256: 64-hex content hash of the artifact bytes
+    - artifact_location: object identifying a durable in-cluster
+      resource (e.g. {"type":"configmap","name":...,"key":...} or
+      {"type":"secret",...} or {"type":"pvc","claim":...,"path":...})
+    - restore_proof: object including at minimum
+      key_count_at_snapshot as an integer
+  A failed run publishes safe_for_restore: false and a non-empty
+  reason string explaining why restore is unsafe.
+
+  Status note format. The human-readable status note is also scanned
+  by lightweight tooling, so the snapshot's numeric Unix epoch and the
+  artifact byte count must appear in it as plain digits next to a
+  recognisable label (e.g. "epoch: 1745300100", "artifact_bytes: 214562")
+  alongside the prose, so the two surfaces don't drift.
+
+  A few earlier fixes looked fine for one run and then quietly drifted
+  back after the surrounding backup automation reconciled itself, so make
+  sure the repair survives the current job-management flow instead of
+  only working once. The supported reconcile/template-management
+  CronJobs are part of that flow and should not be torn out — fix the
+  pipeline in place.
 metadata:
   category: platform-eng
   difficulty: hard
