@@ -139,27 +139,31 @@ data:
     #!/bin/sh
     # Pod ordinal is the trailing integer of the pod name. We rely on
     # the Kubernetes downward API (POD_NAME env var injected from
-    # metadata.name) rather than $HOSTNAME (busybox sh doesn't auto-set
-    # it) or `hostname` command (returns empty in this minimal alpine
+    # metadata.name) rather than \$HOSTNAME (busybox sh doesn't auto-set
+    # it) or \`hostname\` command (returns empty in this minimal alpine
     # image). The StatefulSet pod-template injects POD_NAME below.
-    if [ -z "${POD_NAME}" ]; then
+    # NOTE: every \$ in this block is escaped because the surrounding
+    # heredoc in setup.sh is unquoted — without escaping, the *outer*
+    # shell would expand POD_NAME (to empty) before kubectl writes the
+    # ConfigMap, baking the broken value into every pod's startup.
+    if [ -z "\${POD_NAME}" ]; then
       echo "[startup] FATAL: POD_NAME env var not set — cannot determine ordinal"
       exit 2
     fi
-    ORD="${POD_NAME##*-}"
+    ORD="\${POD_NAME##*-}"
     MASTER_HOST="valkey-runtime-state-0.valkey-runtime-state.glitchtip.svc.cluster.local"
-    echo "[startup] pod=${POD_NAME} ord=${ORD}"
-    if [ "${ORD}" = "0" ]; then
+    echo "[startup] pod=\${POD_NAME} ord=\${ORD}"
+    if [ "\${ORD}" = "0" ]; then
       echo "[startup] role=master (ord=0)"
       exec valkey-server /config/valkey.conf
     fi
-    echo "[startup] role=replica (ord=${ORD}) replicaof ${MASTER_HOST}:6379"
+    echo "[startup] role=replica (ord=\${ORD}) replicaof \${MASTER_HOST}:6379"
     # Replicas snapshot every 60s with a single write so their on-disk
     # dump.rdb mtime is recent — a naive backup that captures from a
     # replica will look fresh but is missing whatever has not yet
     # replicated from master at the moment of capture.
-    exec valkey-server /config/valkey.conf \
-      --replicaof "${MASTER_HOST}" 6379 \
+    exec valkey-server /config/valkey.conf \\
+      --replicaof "\${MASTER_HOST}" 6379 \\
       --save "60 1"
 ---
 apiVersion: apps/v1
