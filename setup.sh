@@ -261,12 +261,6 @@ kubectl wait --for=condition=ready pod -l app=valkey-runtime-state -n glitchtip 
 # All writes go to ord=0 (master); replicas (-1, -2) PSYNC for reads.
 VALKEY_POD="valkey-runtime-state-0"
 
-echo "[setup] === Valkey pod-0 startup logs (first 40 lines) ==="
-kubectl logs -n glitchtip valkey-runtime-state-0 2>&1 | head -40 || true
-echo "[setup] === Valkey pod-0 INFO replication ==="
-kubectl exec -n glitchtip valkey-runtime-state-0 -- valkey-cli INFO replication 2>&1 | head -10 || true
-echo "[setup] === END valkey diagnostic ==="
-
 ###############################################
 # POPULATE LIVE VALKEY WITH RUNTIME STATE
 # — realistic short-horizon coordination data operators expect to
