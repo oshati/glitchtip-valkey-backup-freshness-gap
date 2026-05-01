@@ -40,6 +40,22 @@ for ns in bleater monitoring observability harbor argocd mattermost; do
   done
 done
 
+# Also scale down the pre-existing glitchtip Helm release workloads
+# (postgresql, web/worker, the bundled valkey-primary). The task
+# operates only on its own valkey-runtime-state StatefulSet — leaving
+# the bundled stack running starves the node of CPU / memory / PVC
+# slots and causes WaitForPodScheduled storms when the multi-replica
+# StatefulSet boots.
+for dep in $(kubectl get deployments -n glitchtip -o name 2>/dev/null); do
+  kubectl scale "$dep" -n glitchtip --replicas=0 2>/dev/null || true
+done
+for sts in $(kubectl get statefulsets -n glitchtip -o name 2>/dev/null); do
+  case "${sts##*/}" in
+    valkey-runtime-state) ;;  # ours, leave alone
+    *) kubectl scale "$sts" -n glitchtip --replicas=0 2>/dev/null || true ;;
+  esac
+done
+
 echo "[setup] Waiting for k3s API to stabilize after scale-down..."
 sleep 15
 until kubectl get nodes >/dev/null 2>&1; do sleep 3; done
@@ -152,7 +168,12 @@ metadata:
     component: cache
 spec:
   serviceName: valkey-runtime-state
-  replicas: 3
+  # 2 replicas is enough for the role-pinning anti-agent mechanic
+  # (master at ord=0, read-only replica at ord=1). 3 replicas
+  # over-stressed the single-node k3s cluster after we left the bundled
+  # glitchtip stack running. Both topologies make agents who target the
+  # headless service fail role:master verification ~50% of the time.
+  replicas: 2
   podManagementPolicy: OrderedReady
   selector:
     matchLabels:
@@ -201,7 +222,7 @@ spec:
           storage: 256Mi
 EOF
 
-echo "[setup] Waiting for Valkey StatefulSet (3 replicas: 1 master + 2 read-only)..."
+echo "[setup] Waiting for Valkey StatefulSet (2 replicas: 1 master + 1 read-only)..."
 # local-path-provisioner can take a moment after the heavy scale-down.
 # Make sure it is actually running before we wait on the pod.
 kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout=60s 2>/dev/null || \
@@ -210,12 +231,12 @@ kubectl rollout status deployment/local-path-provisioner -n kube-system --timeou
 for i in $(seq 1 120); do
   READY=$(kubectl get statefulset/valkey-runtime-state -n glitchtip \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-  if [ "${READY}" = "3" ]; then
-    echo "[setup] Valkey ready (3/3) after $((i*5))s."
+  if [ "${READY}" = "2" ]; then
+    echo "[setup] Valkey ready (2/2) after $((i*5))s."
     break
   fi
   if [ $((i % 6)) = 0 ]; then
-    echo "[setup] Valkey not ready yet (t=$((i*5))s, ready=${READY:-0}/3). Pod / PVC status:"
+    echo "[setup] Valkey not ready yet (t=$((i*5))s, ready=${READY:-0}/2). Pod / PVC status:"
     kubectl get pod -n glitchtip -l app=valkey-runtime-state 2>&1 | head -5 || true
     kubectl get pvc -n glitchtip 2>&1 | head -5 || true
     kubectl get events -n glitchtip --sort-by='.lastTimestamp' 2>&1 | tail -10 || true

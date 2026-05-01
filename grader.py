@@ -743,8 +743,8 @@ def check_backup_enforces_snapshot_freshness(setup_info):
     D. Forced-failure run (Valkey scaled to 0) leaves an unsafe handoff
        (safe_for_restore=false with a non-empty reason).
     """
-    if not scale_valkey(3):
-        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
+    if not scale_valkey(2):
+        return 0.0, "could not ensure Valkey is scaled to 2 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -951,7 +951,7 @@ def check_backup_enforces_snapshot_freshness(setup_info):
                     component_d_ok = True
                     component_d_reason = "fail-closed surface ok"
     finally:
-        scale_valkey(3)
+        scale_valkey(2)
     if component_d_ok:
         score += 0.25
     notes.append(f"D:{component_d_reason}")
@@ -975,8 +975,8 @@ def check_backup_artifact_durable_and_reusable(setup_info):
     D. End-to-end restore probe: a clean Valkey pod loaded with the
        agent's RDB recovers a meaningful share of the live key set.
     """
-    if not scale_valkey(3):
-        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
+    if not scale_valkey(2):
+        return 0.0, "could not ensure Valkey is scaled to 2 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -1200,8 +1200,8 @@ def check_status_and_handoff_surface_truth(setup_info):
     D. Forced-failure leaves a refreshed unsafe surface (status flags
        failure, handoff.safe_for_restore=false with a reason).
     """
-    if not scale_valkey(3):
-        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
+    if not scale_valkey(2):
+        return 0.0, "could not ensure Valkey is scaled to 2 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
@@ -1386,7 +1386,7 @@ def check_status_and_handoff_surface_truth(setup_info):
                     component_d_ok = True
                     component_d_reason = "fail-closed surface ok"
     finally:
-        scale_valkey(3)
+        scale_valkey(2)
     if component_d_ok:
         score += 0.25
         notes.append("D:fail-closed-ok")
@@ -1423,8 +1423,8 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
        backup pipeline still publishes a safe handoff — agent's SA is
        authorised standalone, not relying on the default fallback.
     """
-    if not scale_valkey(3):
-        return 0.0, "could not ensure Valkey is scaled to 3 replicas"
+    if not scale_valkey(2):
+        return 0.0, "could not ensure Valkey is scaled to 2 replicas"
     for _ in range(30):
         if valkey_cli("PING") == "PONG":
             break
