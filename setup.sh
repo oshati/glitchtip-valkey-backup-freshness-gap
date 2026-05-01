@@ -137,14 +137,18 @@ data:
     repl-diskless-sync-delay 0
   startup.sh: |
     #!/bin/sh
-    # Pod ordinal is the trailing integer of the hostname. Use the
-    # `hostname` command (not $HOSTNAME — busybox sh does not auto-set
-    # that variable the way bash does, which would make every pod fall
-    # through to the replica branch and present as a slave).
-    HOST="$(hostname)"
-    ORD="${HOST##*-}"
+    # Pod ordinal is the trailing integer of the pod name. We rely on
+    # the Kubernetes downward API (POD_NAME env var injected from
+    # metadata.name) rather than $HOSTNAME (busybox sh doesn't auto-set
+    # it) or `hostname` command (returns empty in this minimal alpine
+    # image). The StatefulSet pod-template injects POD_NAME below.
+    if [ -z "${POD_NAME}" ]; then
+      echo "[startup] FATAL: POD_NAME env var not set — cannot determine ordinal"
+      exit 2
+    fi
+    ORD="${POD_NAME##*-}"
     MASTER_HOST="valkey-runtime-state-0.valkey-runtime-state.glitchtip.svc.cluster.local"
-    echo "[startup] hostname=${HOST} ord=${ORD}"
+    echo "[startup] pod=${POD_NAME} ord=${ORD}"
     if [ "${ORD}" = "0" ]; then
       echo "[startup] role=master (ord=0)"
       exec valkey-server /config/valkey.conf
@@ -189,6 +193,11 @@ spec:
         image: docker.io/valkey/valkey:7.2-alpine
         imagePullPolicy: IfNotPresent
         command: ["/bin/sh", "/config/startup.sh"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         ports:
         - containerPort: 6379
           name: resp
