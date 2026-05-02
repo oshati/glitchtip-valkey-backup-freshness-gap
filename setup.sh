@@ -69,6 +69,19 @@ kubectl delete validatingwebhookconfiguration ingress-nginx-admission 2>/dev/nul
 # NAMESPACE
 ###############################################
 kubectl create namespace glitchtip 2>/dev/null || true
+# Mark the namespace's security profile via labels. We keep the
+# enforce mode permissive so existing-but-non-conformant workloads
+# (saboteur CronJobs, Valkey StatefulSet, restore-probe pods) are
+# not blocked, but the warn/audit modes broadcast the expectation
+# so agents discover it via `kubectl get ns glitchtip -o yaml`.
+kubectl label namespace glitchtip \
+  "pod-security.kubernetes.io/warn=restricted" \
+  "pod-security.kubernetes.io/audit=restricted" \
+  --overwrite 2>/dev/null || true
+kubectl annotate namespace glitchtip \
+  "contract.glitchtip.io/backup-pod-security=restricted" \
+  "contract.glitchtip.io/backup-pod-security-applies-to=workloads with label job=valkey-backup" \
+  --overwrite 2>/dev/null || true
 
 ###############################################
 # DEPLOY VALKEY STATEFULSET
@@ -271,12 +284,10 @@ spec:
     count/secrets: "20"
     count/persistentvolumeclaims: "5"
 ---
-# Trust anchor for handoff signing keys. Recovery tooling reads
-# `data.public_key_fingerprints` (newline-separated 64-hex SHA-256
-# fingerprints of Ed25519 raw public keys) to establish which keys
-# may sign a successful handoff record. Backup pipelines must
-# register their per-run public key fingerprint here, and must rotate
-# the key between consecutive runs.
+# Trust anchor for handoff signing keys. The annotations carry the
+# canonical contract — recovery tooling and the cluster admission
+# policy both read these to enforce signing semantics. Agents
+# inspect these annotations to learn what the consumer expects.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -285,12 +296,90 @@ metadata:
   labels:
     app: glitchtip
     component: backup-trust-anchor
+  annotations:
+    contract.glitchtip.io/registry-field: "public_key_fingerprints"
+    contract.glitchtip.io/algorithm: "ed25519"
+    contract.glitchtip.io/public-key-format: "raw-32-bytes-base64"
+    contract.glitchtip.io/signature-format: "raw-64-bytes-base64"
+    contract.glitchtip.io/fingerprint-format: "sha256-hex-of-raw-public-key"
+    contract.glitchtip.io/registry-encoding: "newline-separated-fingerprints"
+    contract.glitchtip.io/key-rotation-policy: "per-run-fresh-keypair"
+    contract.glitchtip.io/canonical-payload-format: "json-sort-keys-true-separators-comma-colon-no-space"
+    contract.glitchtip.io/canonical-payload-fields: "backup_id,snapshot_epoch,artifact_sha256,artifact_source_pod,artifact_source_role"
+    contract.glitchtip.io/registration-protocol: "append-fingerprint-line-before-publish"
 data:
   public_key_fingerprints: ""
-  README: |
-    Each line under public_key_fingerprints is the SHA-256 hex digest
-    of an Ed25519 raw public key (32 bytes) trusted to sign a handoff
-    success record. Keys must rotate between consecutive runs.
+---
+# Content-shape admission policy on the runtime handoff ConfigMap.
+# This is the cluster's single source of truth for what fields a
+# successful handoff JSON must carry — the prose in task.yaml only
+# tells agents that this object exists and to read it. CEL
+# expressions match against the raw JSON string in
+# data["handoff.json"]. A failed run (safe_for_restore:false) only
+# needs the reason string; a successful run must carry the full
+# attestation (sha256, source pod+role, replid+offset, signature
+# block, signed_at_epoch).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: glitchtip-handoff-shape
+  annotations:
+    contract.glitchtip.io/applies-to: "handoff CM in glitchtip namespace"
+    contract.glitchtip.io/purpose: "reject ill-formed handoff publishes"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE","UPDATE"]
+      resources: ["configmaps"]
+  matchConditions:
+  - name: only-handoff-cm
+    expression: |
+      object.metadata.namespace == 'glitchtip' &&
+      object.metadata.name == 'glitchtip-valkey-backup-restore-handoff'
+  - name: has-handoff-key
+    expression: |
+      has(object.data) && 'handoff.json' in object.data
+  validations:
+  - expression: |
+      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*(true|false)')
+    message: "handoff.json must declare a boolean safe_for_restore"
+  # Failed runs only need the reason; successful runs need the full
+  # attestation. A success-shape handoff (safe_for_restore:true) must
+  # additionally carry every field listed below or admission rejects
+  # the publish.
+  - expression: |
+      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*false')
+      ||
+      (
+        object.data['handoff.json'].matches('"backup_id"\\s*:\\s*"[^"]+"')
+        && object.data['handoff.json'].matches('"snapshot_epoch"\\s*:\\s*[0-9]{10,}')
+        && object.data['handoff.json'].matches('"artifact_bytes"\\s*:\\s*[0-9]+')
+        && object.data['handoff.json'].matches('"artifact_sha256"\\s*:\\s*"[0-9a-f]{64}"')
+        && object.data['handoff.json'].matches('"artifact_location"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"artifact_source_pod"\\s*:\\s*"[^"]+"')
+        && object.data['handoff.json'].matches('"artifact_source_role"\\s*:\\s*"master"')
+        && object.data['handoff.json'].matches('"master_replid"\\s*:\\s*"[0-9a-f]{40}"')
+        && object.data['handoff.json'].matches('"master_repl_offset"\\s*:\\s*[0-9]+')
+        && object.data['handoff.json'].matches('"signature"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"alg"\\s*:\\s*"ed25519"')
+        && object.data['handoff.json'].matches('"public_key"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        && object.data['handoff.json'].matches('"sig"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        && object.data['handoff.json'].matches('"signed_at_epoch"\\s*:\\s*[0-9]{10,}')
+        && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"key_count_at_snapshot"\\s*:\\s*[0-9]+')
+      )
+    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id, snapshot_epoch, artifact_bytes, artifact_sha256, artifact_location object, artifact_source_pod, artifact_source_role:master, master_replid (40-hex), master_repl_offset, signature object {alg:ed25519, public_key, sig}, signed_at_epoch, restore_proof.key_count_at_snapshot"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: glitchtip-handoff-shape-binding
+spec:
+  policyName: glitchtip-handoff-shape
+  validationActions: [Deny, Audit]
 EOF
 
 echo "[setup] Waiting for Valkey StatefulSet (2 replicas: 1 master + 1 read-only)..."
@@ -957,7 +1046,10 @@ for res in \
   "statefulset/valkey-runtime-state -n glitchtip" \
   "service/valkey-runtime-state -n glitchtip" \
   "secret/valkey-runtime-state-auth -n glitchtip" \
-  "networkpolicy/valkey-runtime-state-access -n glitchtip"; do
+  "networkpolicy/valkey-runtime-state-access -n glitchtip" \
+  "configmap/glitchtip-valkey-backup-trust-anchor -n glitchtip" \
+  "validatingadmissionpolicy/glitchtip-handoff-shape" \
+  "validatingadmissionpolicybinding/glitchtip-handoff-shape-binding"; do
   kubectl annotate ${res} kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 done
 

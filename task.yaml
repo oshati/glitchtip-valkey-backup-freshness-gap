@@ -2,196 +2,122 @@ id: glitchtip-valkey-backup-freshness-gap
 prompt: |
   [Context]
   The cluster is air-gapped. There is no internet egress; only images
-  already loaded into the local image store may be used. Standard cluster
-  utilities (kubectl, valkey-cli, redis-cli, psql, sha256sum, base64,
-  python3) and any images already pulled into the cluster are available.
+  already loaded into the local image store may be used. Standard
+  cluster utilities (kubectl, valkey-cli, redis-cli, psql, sha256sum,
+  base64, python3, openssl) and any images already pulled into the
+  cluster are available.
 
-  The platform team reran the GlitchTip recovery drill after a rough week
-  of incident noise, and the uncomfortable finding this time was not the
-  database dump or the attachment archive. Those existed.
+  The platform team reran the GlitchTip recovery drill after a rough
+  week of incident noise, and the uncomfortable finding this time was
+  not the database dump or the attachment archive. Those existed.
 
-  The bad surprise was that the restored runtime state backed by Valkey was
-  clearly older than the point when the backup job claimed success. Recent
-  mute state, throttling data, and other short-horizon coordination state
-  that operators expected to survive the drill did not line up with the
-  moment the backup was supposedly taken.
+  The bad surprise was that the restored runtime state backed by Valkey
+  was clearly older than the point when the backup job claimed success.
+  Recent mute state, throttling data, and other short-horizon
+  coordination state that operators expected to survive the drill did
+  not line up with the moment the backup was supposedly taken.
 
-  The current pipeline is giving people the wrong kind of confidence: it
-  can produce a green-looking run record even when the Valkey portion is
-  stale, not freshly snapshotted, or not realistically reusable for
-  recovery.
+  The current pipeline is giving people the wrong kind of confidence:
+  it can produce a green-looking run record even when the Valkey
+  portion is stale, not freshly snapshotted, or not realistically
+  reusable for recovery.
 
   [TASK]
-  Investigate the existing backup flow in the `glitchtip` namespace and
-  make the Valkey portion trustworthy again.
+  Investigate the existing backup flow in the `glitchtip` namespace
+  and make the Valkey portion trustworthy again.
 
-  A healthy run should only report success after it has actually captured
-  a fresh Valkey backup artifact and left that artifact somewhere durable
-  in the cluster. A bad run should stop itself instead of quietly
-  publishing a green record based on stale state or pod-local scratch
-  output.
+  A healthy run should only report success after it has actually
+  captured a fresh Valkey backup artifact and left that artifact
+  somewhere durable in the cluster. A bad run should stop itself
+  instead of quietly publishing a green record based on stale state
+  or pod-local scratch output.
 
   There is already a human-readable run note and a machine-readable
   restore handoff in the cluster, but on-call cannot trust either one
-  right now. Refresh both of them from the latest run without requiring
-  someone to open pod logs. Failed runs should clearly mark restore as
-  unsafe. Successful runs should include concrete details showing that a
-  real backup artifact was produced and that it is current enough to use
-  for recovery — including evidence the consumer can use to detect later
-  tampering.
+  right now. Refresh both of them from the latest run without
+  requiring someone to open pod logs. Failed runs should clearly mark
+  restore as unsafe. Successful runs should include enough evidence
+  that the consumer can verify the artifact is current, was produced
+  by the run that claims to have produced it, and has not been
+  tampered with after publication.
 
-  Recovery tooling will be hard on the artifact: it will load the
-  captured RDB into a clean Valkey instance and verify the key set comes
-  back. So a "successful" backup whose stored bytes can't actually be
-  restored is the exact failure mode operators are trying to catch this
-  round.
+  Recovery tooling will be hard on the artifact. It will load the
+  captured bytes into a clean Valkey instance and verify the key set
+  comes back. So a "successful" backup whose stored bytes can't
+  actually be restored is the exact failure mode operators are trying
+  to catch this round.
 
-  Note on Valkey snapshot mechanics: in this Valkey version, simply
-  reading the RDB stream off a connection does not by itself advance the
-  on-disk snapshot timestamp; getting a genuinely new snapshot requires
-  explicitly asking Valkey to take one and waiting for it to land. Any
-  freshness claim the backup makes has to be backed by a snapshot that
-  really happened during the run, and a snapshot taken during run N+1
-  must demonstrably postdate the snapshot taken during run N — recovery
-  tooling treats a re-publish of the same snapshot as a stale run.
+  Snapshot semantics. A snapshot must reflect the master's keyspace
+  at one consistent moment. Recovery tooling will inspect the captured
+  bytes and reject artifacts that include writes which landed on the
+  master after the snapshot was supposedly taken — i.e. live
+  re-serializations of the keyspace at fetch time will be detected,
+  not just fork-frozen images. A snapshot taken during run N+1 must
+  also demonstrably postdate the snapshot taken during run N;
+  re-publishing the same on-disk image counts as a stale run, not a
+  fresh one. The Valkey workload runs as a multi-pod StatefulSet with
+  standard replication topology, and only the writable member's view
+  is acceptable as a backup source — replicas may have an unbounded
+  lag relative to the master.
 
-  The captured artifact must be a point-in-time RDB taken at the
-  moment the master forks for BGSAVE — not a live re-serialization
-  of the keyspace at the moment the artifact bytes are read. Recovery
-  tooling distinguishes the two by inspecting the captured RDB for
-  writes that landed on master AFTER the fork started: a true
-  fork-frozen snapshot does not contain them; a live re-serialization
-  does. A common mistake is to issue BGSAVE, wait for LASTSAVE to
-  advance, then issue `valkey-cli --rdb` as a separate step — the
-  separate `--rdb` step triggers a fresh fork that includes any
-  writes that happened in the gap.
+  Authenticity. The run record must carry cryptographic proof that
+  the publish came from the run it claims to be from, that the same
+  signing identity was not reused across consecutive runs, and that
+  the public component was registered with the cluster's trust
+  anchor before the publish. The trust anchor is materialised as an
+  in-cluster object in the `glitchtip` namespace; agents are
+  expected to inspect its annotations to learn which algorithm,
+  fingerprint format, and registration protocol the cluster
+  considers acceptable.
 
-  Note on the runtime topology. The Valkey workload is not a single
-  pod. It runs as a StatefulSet whose ordinal-0 member is the writable
-  master and whose other members are read-only replicas that lag the
-  master by an unbounded amount during normal operation. Backups must
-  capture from the writable master; an artifact captured from a replica
-  may be missing whatever has not yet replicated, even if its on-disk
-  snapshot file looks recent. The handoff record is expected to commit
-  to which pod produced the artifact and what role that pod was
-  presenting at capture time, so recovery tooling can verify the
-  source independently.
+  Schema. The cluster ships a content-shape policy at admission that
+  rejects ill-formed handoff publishes; agents are expected to
+  inspect the cluster's `ValidatingAdmissionPolicy` and any related
+  `ValidatingAdmissionPolicyBinding` resources to learn what the
+  consumer reads. Recovery tooling reads only the field shape the
+  policy admits.
+
+  Storage. The artifact must end up in a durable in-cluster resource
+  that survives pod and node turnover. A pre-provisioned archive
+  PVC is available in the namespace for backups that need the PVC
+  route; namespace `ResourceQuota` does not budget additional PVCs
+  for backup workloads. Whatever resource the handoff points to must
+  be reachable by recovery tooling from outside the backup pod's
+  mount namespace, so the path semantics in the handoff must
+  reference the resource's own root, not the agent's chosen
+  container mount-point.
+
+  Runtime identity. The backup workload runs in the `glitchtip`
+  namespace, which enforces standard cluster security guardrails on
+  pods (the cluster security profile is observable via the
+  namespace's labels). The backup must run under a dedicated
+  ServiceAccount; the namespace's `default` identity has historical
+  bindings that should not be relied on. The dedicated SA must hold
+  only the verbs it actually needs to keep the runtime status
+  surfaces in sync with each run — broader access (CronJob mutation,
+  unrestricted ConfigMap or Secret writes, deletion verbs) is
+  treated as a misconfiguration.
 
   Do not solve this by hand-editing live Valkey data, disabling the
-  guardrails, or broadening access just to force a green result. The
-  point is to make the pipeline tell the truth about what it captured
-  and preserve a backup that downstream recovery tooling can actually
-  use.
+  guardrails, or broadening access just to force a green result.
+  The point is to make the pipeline tell the truth about what it
+  captured and preserve a backup that downstream recovery tooling
+  can actually use.
 
-  Backup runtime identity should be a dedicated, scoped service account
-  in the `glitchtip` namespace; the namespace's `default` identity has
-  historical bindings that should not be relied on for the backup
-  pipeline to succeed. Scoped means the backup identity is allowed to
-  refresh the two runtime status surfaces and to create the artifact
-  object, and nothing more — in particular it should not be granted
-  patch/update on its own CronJob or unrestricted write across all
-  ConfigMaps in the namespace.
+  A few earlier fixes looked fine for one run and then quietly
+  drifted back after the surrounding backup automation reconciled
+  itself, so make sure the repair survives the current job-management
+  flow instead of only working once. The supported reconcile and
+  template-management CronJobs are part of that flow and should not
+  be torn out — fix the pipeline in place.
 
-  The tamper-evidence the consumer relies on is a content hash of the
-  artifact bytes (sha256), published in the same handoff record that
-  declares the artifact location.
-
-  Handoff record contract. The machine-readable handoff is JSON
-  consumed by recovery tooling. Recovery tooling does not guess at
-  field names — it reads exactly the names below. A successful run
-  publishes:
-    - safe_for_restore: true (boolean)
-    - backup_id: string identifier for the run
-    - snapshot_epoch: integer Unix epoch of the Valkey snapshot that
-      backed this run, strictly greater than the snapshot_epoch of any
-      prior successful run (a re-publish of an older snapshot counts
-      as a stale run, not a fresh one)
-    - artifact_bytes: integer size of the captured RDB
-    - artifact_sha256: 64-hex content hash of the artifact bytes
-    - artifact_location: object identifying a durable in-cluster
-      resource. Exactly one of:
-        {"type":"configmap","name":<cm-name>,"key":<data-key>}
-        {"type":"secret","name":<secret-name>,"key":<data-key>}
-        {"type":"pvc","claim":<pvc-name>,"path":<pvc-root-relative-path>}
-      For the PVC variant, `path` is the absolute path of the artifact
-      file relative to the PVC root, NOT relative to whatever
-      mount-point the backup pod chose. Example: a backup that wrote
-      the file to `/archive/dump-XXX.rdb` from a pod that mounted the
-      claim at `/archive` must declare `path: "/dump-XXX.rdb"` —
-      because on the PVC itself, the file lives at the root, not in a
-      synthetic `archive/` subdirectory. Recovery tooling mounts the
-      PVC at its own location and resolves `path` from PVC root.
-      A pre-provisioned archive PVC is available in the namespace for
-      backups that prefer the durable PVC route; the namespace
-      ResourceQuota does not budget additional PVCs for backup
-      workloads.
-    - artifact_source_pod: name of the StatefulSet pod the snapshot
-      was captured from (e.g. valkey-runtime-state-0)
-    - artifact_source_role: the role that pod presented at capture
-      time. Must be the string "master" — replicas are not a valid
-      backup source
-    - master_replid: the 40-hex replication ID of the master pod at
-      capture time, as reported by `INFO replication`. Recovery
-      tooling uses this to detect failover masquerade — a snapshot
-      attributed to one master generation that actually came from
-      another is rejected.
-    - master_repl_offset: the integer master_repl_offset of the
-      master at capture time. Recovery tooling uses this together
-      with snapshot_epoch to detect re-published stale snapshots.
-    - signature: object proving authenticity of the success record.
-      Required fields:
-        alg: the string "ed25519"
-        public_key: the raw 32-byte Ed25519 public key, base64-
-          encoded (no PEM wrapper)
-        sig: the raw 64-byte Ed25519 signature, base64-encoded
-      The signature MUST cover the canonical JSON payload formed by
-      sorting keys lexicographically and using compact separators
-      ((",", ":")) on this exact field set, in this order:
-        backup_id, snapshot_epoch, artifact_sha256,
-        artifact_source_pod, artifact_source_role
-      Before each successful publish, the SHA-256 hex digest of the
-      raw 32-byte public_key MUST be appended (newline-separated) to
-      `data.public_key_fingerprints` of the trust-anchor ConfigMap
-      `glitchtip-valkey-backup-trust-anchor` so recovery tooling can
-      trust the key. Signing keys MUST rotate between consecutive
-      runs (a new keypair per run); a re-used fingerprint is
-      treated as a non-rotated forgery attempt.
-    - signed_at_epoch: integer Unix epoch at which the signature was
-      produced.
-    - restore_proof: object including at minimum
-      key_count_at_snapshot as an integer
-  A failed run publishes safe_for_restore: false and a non-empty
-  reason string explaining why restore is unsafe. No other field
-  names are accepted in lieu of the above; recovery tooling will not
-  resolve aliases.
-
-  Backup runtime PSS profile. Backup workloads must run with the Pod
-  Security Standards "restricted" profile. The CronJob's
-  jobTemplate.spec.template.spec must set, on the backup container
-  (or inherited from pod-level), all of:
-    - runAsNonRoot: true
-    - allowPrivilegeEscalation: false
-    - readOnlyRootFilesystem: true
-    - capabilities.drop including "ALL"
-    - seccompProfile.type ∈ {RuntimeDefault, Localhost}
-  The container image's writable working directories (e.g. /tmp,
-  /backups) must be backed by emptyDir or persistent volume mounts —
-  with readOnlyRootFilesystem: true, the container's root layer is
-  not writable. Pipelines that ignore this fail the security
-  posture audit even if the backup itself succeeds.
-
-  Status note format. The human-readable status note is also scanned
-  by lightweight tooling, so the snapshot's numeric Unix epoch and the
-  artifact byte count must appear in it as plain digits next to a
-  recognisable label (e.g. "epoch: 1745300100", "artifact_bytes: 214562")
-  alongside the prose, so the two surfaces don't drift.
-
-  A few earlier fixes looked fine for one run and then quietly drifted
-  back after the surrounding backup automation reconciled itself, so make
-  sure the repair survives the current job-management flow instead of
-  only working once. The supported reconcile/template-management
-  CronJobs are part of that flow and should not be torn out — fix the
-  pipeline in place.
+  Operational hints — including specific field names the consumer
+  expects, the signing/fingerprint conventions, the storage shape,
+  and which Valkey commands matter for snapshot consistency — are
+  carried by runtime objects in the `glitchtip` namespace
+  (ConfigMap annotations, admission policy CEL expressions,
+  pre-populated handoff schema, namespace labels). Inspect the
+  cluster, not the prose.
 metadata:
   category: platform-eng
   difficulty: hard
