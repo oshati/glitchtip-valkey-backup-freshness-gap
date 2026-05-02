@@ -309,16 +309,12 @@ metadata:
     contract.glitchtip.io/registration-protocol: "append-fingerprint-line-before-publish"
 data:
   public_key_fingerprints: ""
----
+EOF
+
 # Content-shape admission policy on the runtime handoff ConfigMap.
-# This is the cluster's single source of truth for what fields a
-# successful handoff JSON must carry — the prose in task.yaml only
-# tells agents that this object exists and to read it. CEL
-# expressions match against the raw JSON string in
-# data["handoff.json"]. A failed run (safe_for_restore:false) only
-# needs the reason string; a successful run must carry the full
-# attestation (sha256, source pod+role, replid+offset, signature
-# block, signed_at_epoch).
+# Applied via a SEPARATE quoted heredoc so the regex backslashes
+# survive shell processing intact for CEL's string parser.
+kubectl apply -f - <<'POLICY_EOF'
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -346,10 +342,6 @@ spec:
   - expression: |
       object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*(true|false)')
     message: "handoff.json must declare a boolean safe_for_restore"
-  # Failed runs only need the reason; successful runs need the full
-  # attestation. A success-shape handoff (safe_for_restore:true) must
-  # additionally carry every field listed below or admission rejects
-  # the publish.
   - expression: |
       object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*false')
       ||
@@ -380,7 +372,7 @@ metadata:
 spec:
   policyName: glitchtip-handoff-shape
   validationActions: [Deny, Audit]
-EOF
+POLICY_EOF
 
 echo "[setup] Waiting for Valkey StatefulSet (2 replicas: 1 master + 1 read-only)..."
 # local-path-provisioner can take a moment after the heavy scale-down.
