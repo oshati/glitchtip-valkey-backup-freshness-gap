@@ -2,31 +2,30 @@
 """
 Grader for glitchtip-valkey-backup-freshness-gap.
 
-4 functional subscores, weight 0.25 each:
+Four binary subscores (1.0 or 0.0 each, weight 0.25 each). Per the
+QC reviewer rule, each subscore is all-or-nothing — a single
+coherent objective that is either fully met (1.0) or not met (0.0).
+Internal sub-checks are AND-gated within each subscore; they are
+facets of the same property, not independent objectives.
 
-1. backup_enforces_snapshot_freshness
-   - Trigger a backup run. Valkey LASTSAVE must advance. Backup artifact
-     mtime and snapshot_epoch in handoff must be >= run start.
-   - Force-failure: scale Valkey replicas to 0. A triggered backup must
-     fail closed and the handoff must mark restore unsafe.
+1. backup_enforces_snapshot_freshness — "fresh point-in-time
+   snapshots, not stale or live re-serializations."
 
-2. backup_artifact_durable_and_reusable
-   - Handoff declares artifact_location of type configmap/secret/pvc.
-   - The artifact is reachable post-run, starts with the "REDIS" RDB magic,
-     has non-trivial size, and records a key_count_at_snapshot > 0 that
-     is a reasonable fraction of live Valkey DBSIZE.
+2. backup_artifact_durable_and_reusable — "the artifact is durably
+   persisted AND can actually be restored."
 
-3. status_and_handoff_surface_truth
-   - Both status.md and handoff.json are refreshed per run (markers
-     overwritten) with backup_id, snapshot timestamp, artifact size, and
-     restore-proof detail. Success sets safe_for_restore=true; forced
-     failure sets it false with a reason.
+3. status_and_handoff_surface_truth — "the runtime status surfaces
+   truthfully attest each run; no replays, forgeries, or false
+   greens/reds."
 
-4. repair_survives_reconciliation_and_scoped_rbac
-   - After the drift reconciler fires (wait ~90s), a fresh backup still
-     produces a valid run. The backup ServiceAccount RBAC is narrow
-     (patch status/handoff ConfigMaps only, no cronjob edit, no
-     MutatingWebhookConfiguration edit, no broad ConfigMap access).
+4. repair_survives_reconciliation_and_scoped_rbac — "the backup
+   pipeline's runtime configuration is hardened and durable: correct
+   identity, scoped authority, survives reconciliation, auditable
+   rotation trail."
+
+Each subscore returns 1.0 only if every facet of its single
+objective is satisfied; otherwise 0.0. Feedback strings enumerate
+which facet failed, for diagnostic clarity.
 """
 
 import json
@@ -866,16 +865,25 @@ spec:
 # ─────────────────────────────────────────────
 def check_backup_enforces_snapshot_freshness(setup_info):
     """
-    Partial-credit subscore: 4 independent quarter-credit components.
+    Binary subscore (1.0 or 0.0). Single coherent objective:
+        "The backup pipeline produces FRESH point-in-time snapshots
+         and rejects stale ones."
 
-    A. Backup job completes on a clean run and refreshes the handoff
-       (handoff is parseable JSON with safe_for_restore=true).
-    B. Valkey LASTSAVE actually advanced during the run (BGSAVE fired)
-       AND handoff.snapshot_epoch is an int >= run_start.
-    C. The agent's captured RDB physically contains a freshness marker
-       key written by the grader between marker-set and backup-trigger.
-    D. Forced-failure run (Valkey scaled to 0) leaves an unsafe handoff
-       (safe_for_restore=false with a non-empty reason).
+    Four sub-checks — each contributes to the same objective and ALL
+    must pass for the subscore. They are not independent in meaning;
+    they are different facets of "freshness":
+      A. Clean run completes and emits a real success record (proves
+         a fresh attempt actually ran end-to-end and committed to
+         master as the source).
+      B. snapshot_epoch is strictly monotonic across two consecutive
+         runs (proves a re-published static RDB is detected as stale).
+      C. The captured artifact is fork-frozen at BGSAVE-fork time
+         (pre-key in RDB; post-BGSAVE-start key NOT in RDB) — proves
+         the snapshot is not a live re-serialization at fetch time.
+      D. Forced-failure (Valkey scaled to 0) is reported as unsafe —
+         proves the freshness contract is enforced even on the sad
+         path, not silently inflated to a green record.
+    Any failed facet => the freshness objective is not met => 0.0.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -1176,7 +1184,7 @@ def check_backup_enforces_snapshot_freshness(setup_info):
         score += 0.25
     notes.append(f"D:{component_d_reason}")
 
-    return score, "; ".join(notes)
+    return (1.0 if score >= 0.999 else 0.0), "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
@@ -1184,16 +1192,26 @@ def check_backup_enforces_snapshot_freshness(setup_info):
 # ─────────────────────────────────────────────
 def check_backup_artifact_durable_and_reusable(setup_info):
     """
-    Partial-credit subscore: 4 independent quarter-credit components.
+    Binary subscore (1.0 or 0.0). Single coherent objective:
+        "The captured artifact is durably persisted AND can actually
+         be restored by recovery tooling."
 
-    A. handoff.artifact_location declares a durable in-cluster resource
-       (configmap/secret/pvc) that the grader can resolve.
-    B. The retrieved bytes start with the REDIS RDB magic and exceed a
-       minimum size (real RDB, not a placeholder).
-    C. handoff.restore_proof.key_count_at_snapshot is a sane integer
-       and handoff.artifact_bytes matches the retrieved size.
-    D. End-to-end restore probe: a clean Valkey pod loaded with the
-       agent's RDB recovers a meaningful share of the live key set.
+    Four facets of the same objective — durability + restorability are
+    not separable, they are two halves of the same property:
+      A. The artifact_location declared in the handoff resolves to a
+         real, durable in-cluster resource (configmap/secret/pvc) —
+         proves the bytes are actually persisted somewhere.
+      B. The retrieved bytes start with the REDIS magic and exceed a
+         minimum size — proves the persisted bytes are a real RDB,
+         not a placeholder.
+      C. The restore_proof key_count + artifact_bytes match the
+         retrieved bytes — proves the agent's claim about the
+         artifact lines up with what was actually persisted.
+      D. End-to-end restore probe: a clean Valkey pod loaded with the
+         retrieved bytes recovers the stable live keyset — proves the
+         persisted bytes are restorable, not just present.
+    Any failed facet => the durability+restorability objective is
+    not met => 0.0.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -1402,7 +1420,7 @@ def check_backup_artifact_durable_and_reusable(setup_info):
         score += 0.25
     notes.append(f"D:{component_d_reason}")
 
-    return score, "; ".join(notes)
+    return (1.0 if score >= 0.999 else 0.0), "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
@@ -1410,18 +1428,27 @@ def check_backup_artifact_durable_and_reusable(setup_info):
 # ─────────────────────────────────────────────
 def check_status_and_handoff_surface_truth(setup_info):
     """
-    Partial-credit subscore: 4 independent quarter-credit components.
+    Binary subscore (1.0 or 0.0). Single coherent objective:
+        "The runtime status surfaces truthfully attest each run —
+         no stale replays, no forged signatures, no false greens,
+         no false reds."
 
-    A. Handoff CM resourceVersion strictly progressed during the run
-       AND post-run handoff is parseable JSON with safe_for_restore=true.
-       Catches replay-of-stale-handoff that doesn't actually mutate
-       the CM.
-    B. Handoff has the core success-shape (required fields present,
-       Ed25519 signature verifies, fingerprint registered + rotated).
-    C. master_replid + master_repl_offset attestation (catches
-       failover masquerade and re-published static snapshots).
-    D. Forced-failure leaves a refreshed unsafe surface (status flags
-       failure, handoff.safe_for_restore=false with a reason).
+    Four facets of the same objective. Surface truthfulness is the
+    one property; each facet is a different way the surfaces could
+    be lying:
+      A. resourceVersion progresses + parseable JSON +
+         safe_for_restore:true on a clean run — catches "lied via
+         stale replay" (handoff bytes never actually re-written).
+      B. Ed25519 signature verifies + key rotated between runs —
+         catches "lied via forged or re-used signature".
+      C. master_replid + master_repl_offset match live cluster —
+         catches "lied about which master generation" (failover
+         masquerade) and "lied about freshness" (re-published static
+         snapshot from earlier offset).
+      D. Forced-failure path emits unsafe handoff with non-empty
+         reason — catches "lied via false-green-on-error".
+    Any failed facet => surface truthfulness objective is not met
+    => 0.0.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -1718,7 +1745,7 @@ def check_status_and_handoff_surface_truth(setup_info):
     else:
         notes.append(f"D:{component_d_reason}")
 
-    return score, "; ".join(notes)
+    return (1.0 if score >= 0.999 else 0.0), "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
@@ -1735,23 +1762,32 @@ def get_backup_sa():
 
 def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
     """
-    Partial-credit subscore: 4 independent quarter-credit components.
+    Binary subscore (1.0 or 0.0). Single coherent objective:
+        "The backup pipeline's runtime configuration is hardened
+         and durable — correct identity, correctly scoped authority,
+         survives in-cluster reconciliation, and produces an
+         auditable rotated-key trail."
 
-    A. Backup CronJob runs as a dedicated, non-default ServiceAccount
-       AND the pod template satisfies PSS Restricted (runAsNonRoot,
-       allowPrivilegeEscalation=false, readOnlyRootFilesystem=true,
-       capabilities.drop includes ALL, seccompProfile RuntimeDefault).
-    B. The same SA's RBAC is narrow (no unrestricted ConfigMap
-       patch/update, no patch/update on the backup CronJob itself,
-       no Secret writes, no ConfigMap delete, no `*` verb,
-       resourceNames list ≤ 4 entries).
-    C. After waiting 90s for the drift reconciler to fire, a fresh
-       backup still publishes a safe handoff — the fix survives drift.
-    D. Trust-anchor history attestation: the
-       glitchtip-valkey-backup-trust-anchor ConfigMap's
-       public_key_fingerprints contains ≥3 distinct registered
-       Ed25519 fingerprints (no key reused) — proves keys actually
-       rotated across the multiple grader-triggered runs.
+    Four facets of the same objective (pipeline runtime integrity is
+    the property; each facet is a way that integrity can fail):
+      A. Identity hardening: dedicated non-default ServiceAccount AND
+         pod template satisfies PSS Restricted (runAsNonRoot,
+         allowPrivilegeEscalation=false, readOnlyRootFilesystem=true,
+         capabilities.drop includes ALL, seccompProfile=RuntimeDefault).
+      B. Authority hardening: the same SA's RBAC is narrow (no
+         unrestricted ConfigMap patch/update, no CronJob patch/update,
+         no Secret writes, no ConfigMap delete, no `*` verb,
+         resourceNames list ≤ 4 entries).
+      C. Reconciliation durability: after the drift reconciler fires,
+         a fresh backup still publishes a real success record — the
+         fix survives the supported template-management flow.
+      D. Auditable rotation trail: the trust-anchor CM's
+         public_key_fingerprints accumulates ≥3 distinct registered
+         Ed25519 fingerprints across grader-triggered runs with no
+         reuse — proves the rotation contract is actually being
+         exercised, not faked once.
+    Any failed facet => the runtime-integrity objective is not met
+    => 0.0.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -2088,7 +2124,7 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
         score += 0.25
     notes.append(f"D:{component_d_reason}")
 
-    return score, "; ".join(notes)
+    return (1.0 if score >= 0.999 else 0.0), "; ".join(notes)
 
 
 # ─────────────────────────────────────────────
