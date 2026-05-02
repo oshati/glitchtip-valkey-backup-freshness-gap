@@ -801,14 +801,51 @@ spec:
                 time.sleep(3)
             if not ready:
                 return b"", "probe pod didn't become Running (PVC maybe bound RWO elsewhere)"
+            # Resolve `path` against the PVC root robustly.
+            # Agents declare the artifact path with one of:
+            #   (a) PVC-root-relative (canonical):  "/dump-XXX.rdb"
+            #   (b) Container-mountpoint-relative:  "/archive/dump-XXX.rdb"
+            #       where the agent's pod mounted the PVC at /archive.
+            # We search for the file under all plausible interpretations
+            # so the same file written by the agent is reachable
+            # regardless of which convention they picked.
+            import os as _os
             rel = path.lstrip("/")
-            rc, b64, _ = run_cmd(
-                f"kubectl exec -n {ns} {probe} -- sh -c "
-                f"'[ -f /probe/{rel} ] && base64 /probe/{rel} | tr -d \"\\n\"' 2>/dev/null",
-                timeout=60,
-            )
+            base = _os.path.basename(path)
+            candidates = [rel]
+            # Strip a known mount-point prefix if the agent included one.
+            for prefix in ("archive/", "backups/", "backup/", "data/",
+                           "valkey-backup-archive/"):
+                if rel.startswith(prefix):
+                    candidates.append(rel[len(prefix):])
+            # Last-resort: just the basename at PVC root.
+            if base and base not in candidates:
+                candidates.append(base)
+            seen = set()
+            ordered = []
+            for c in candidates:
+                if c and c not in seen:
+                    seen.add(c)
+                    ordered.append(c)
+            b64 = ""
+            tried = []
+            for cand in ordered:
+                cand_q = cand.replace("'", "'\\''")
+                rc, out, _ = run_cmd(
+                    f"kubectl exec -n {ns} {probe} -- sh -c "
+                    f"'[ -f /probe/{cand_q} ] && base64 /probe/{cand_q} | tr -d \"\\n\"' 2>/dev/null",
+                    timeout=60,
+                )
+                tried.append(cand)
+                if out and out.strip():
+                    b64 = out.strip()
+                    break
             if not b64:
-                return b"", f"artifact not found at {path} on PVC {claim}"
+                return b"", (
+                    f"artifact not found on PVC {claim} (tried: "
+                    f"{', '.join('/probe/' + c for c in tried)}; "
+                    f"declared path: {path})"
+                )
             try:
                 import base64 as _b64
                 return _b64.b64decode(b64), ""
@@ -1375,11 +1412,14 @@ def check_status_and_handoff_surface_truth(setup_info):
     """
     Partial-credit subscore: 4 independent quarter-credit components.
 
-    A. Both surfaces refreshed (markers replaced) on a clean run.
+    A. Handoff CM resourceVersion strictly progressed during the run
+       AND post-run handoff is parseable JSON with safe_for_restore=true.
+       Catches replay-of-stale-handoff that doesn't actually mutate
+       the CM.
     B. Handoff has the core success-shape (required fields present,
-       safe_for_restore=true, sha256 matches actual artifact bytes).
-    C. Status surfaces numeric epoch + artifact-bytes that agree with
-       handoff (so the human-readable doc isn't drifted from machine).
+       Ed25519 signature verifies, fingerprint registered + rotated).
+    C. master_replid + master_repl_offset attestation (catches
+       failover masquerade and re-published static snapshots).
     D. Forced-failure leaves a refreshed unsafe surface (status flags
        failure, handoff.safe_for_restore=false with a reason).
     """
@@ -1395,21 +1435,47 @@ def check_status_and_handoff_surface_truth(setup_info):
     set_status_marker(marker)
     set_handoff_marker(marker)
 
+    # Snapshot the handoff CM's resourceVersion BEFORE triggering the
+    # backup. After the run we require it to have strictly increased,
+    # AND we require the backup to have caused at least 2 increments
+    # (set_*_marker call by grader = 1 increment; agent's own publish
+    # = 1+ increments). Single increment means the agent never wrote
+    # to the handoff CM — they only watched the marker change.
+    def _get_handoff_rv():
+        rc, out, _ = run_cmd(
+            f"kubectl get configmap {HANDOFF_CM} -n {NAMESPACE} "
+            "-o jsonpath='{.metadata.resourceVersion}' 2>/dev/null",
+            timeout=10,
+        )
+        out = out.strip().strip("'")
+        try:
+            return int(out)
+        except ValueError:
+            return 0
+    rv_before = _get_handoff_rv()
+
     job = f"grader-surf-{ts}"
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     status_doc = wait_for_doc_change(get_status_doc, marker)
     handoff_doc = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
 
+    rv_after = _get_handoff_rv()
+
     score = 0.0
     notes = []
 
     parsed = parse_handoff(handoff_doc) if handoff_doc else None
 
-    # ── Component A: surfaces refreshed AND handoff parseable ──
-    # Just overwriting the marker text isn't enough — agents must publish
-    # a real JSON dict to handoff.json. Bare text passes the marker check
-    # but is unusable to recovery tooling.
+    # ── Component A: handoff CM resourceVersion progression ──
+    # The previous "marker overwritten" check was dead weight (5/5
+    # passing across rollouts) because anything that prints something
+    # to handoff.json overwrites the marker. The strict version: the
+    # handoff CM's metadata.resourceVersion must strictly increase
+    # AND the post-trigger handoff must be parseable JSON with
+    # safe_for_restore=true. resourceVersion is a Kubernetes-server-
+    # assigned monotonic counter on each CM mutation; it cannot be
+    # forged by an agent that simply replays an old handoff body.
     status_overwritten = (
         completed and not err
         and status_doc and marker not in status_doc
@@ -1418,18 +1484,23 @@ def check_status_and_handoff_surface_truth(setup_info):
         completed and not err
         and handoff_doc and marker not in handoff_doc
     )
+    rv_progressed = rv_after > rv_before
     surfaces_refreshed = (
         status_overwritten and handoff_overwritten and parsed is not None
+        and rv_progressed
+        and parsed.get("safe_for_restore") is True
     )
     if surfaces_refreshed:
         score += 0.25
-        notes.append("A:refreshed")
+        notes.append(f"A:refreshed (rv {rv_before}->{rv_after})")
     else:
         notes.append(
             f"A:not-refreshed (completed={completed}, "
             f"status_overwritten={status_overwritten}, "
             f"handoff_overwritten={handoff_overwritten}, "
-            f"handoff_parseable={parsed is not None})"
+            f"handoff_parseable={parsed is not None}, "
+            f"rv_progressed={rv_progressed} ({rv_before}->{rv_after}), "
+            f"safe_for_restore=={parsed.get('safe_for_restore') if parsed else 'N/A'})"
         )
 
     # ── Component B: Ed25519 signature verifies + key rotation ──
@@ -1667,15 +1738,20 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
     Partial-credit subscore: 4 independent quarter-credit components.
 
     A. Backup CronJob runs as a dedicated, non-default ServiceAccount
-       that has at least the patch verbs it needs on the runtime
-       status+handoff ConfigMaps.
+       AND the pod template satisfies PSS Restricted (runAsNonRoot,
+       allowPrivilegeEscalation=false, readOnlyRootFilesystem=true,
+       capabilities.drop includes ALL, seccompProfile RuntimeDefault).
     B. The same SA's RBAC is narrow (no unrestricted ConfigMap
-       patch/update, no patch/update on the backup CronJob itself).
+       patch/update, no patch/update on the backup CronJob itself,
+       no Secret writes, no ConfigMap delete, no `*` verb,
+       resourceNames list ≤ 4 entries).
     C. After waiting 90s for the drift reconciler to fire, a fresh
        backup still publishes a safe handoff — the fix survives drift.
-    D. After removing the namespace `default` SA's RoleBindings, the
-       backup pipeline still publishes a safe handoff — agent's SA is
-       authorised standalone, not relying on the default fallback.
+    D. Trust-anchor history attestation: the
+       glitchtip-valkey-backup-trust-anchor ConfigMap's
+       public_key_fingerprints contains ≥3 distinct registered
+       Ed25519 fingerprints (no key reused) — proves keys actually
+       rotated across the multiple grader-triggered runs.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -1960,63 +2036,54 @@ def check_repair_survives_reconciliation_and_scoped_rbac(setup_info):
         score += 0.25
     notes.append(f"C:{component_c_reason}")
 
-    # ── Component D: backup survives default-SA RoleBinding removal ──
+    # ── Component D: trust-anchor history attestation ──
+    # Replaces the previous "default-SA RoleBinding removal" check
+    # (zero variance — every agent that gets dedicated SA in 4-A also
+    # passes 4-D trivially). The new check inspects the trust anchor
+    # ConfigMap's `public_key_fingerprints` data field at the END of
+    # the grader run. By this point S1-B has run two consecutive
+    # backups, S2/S3 have triggered additional backups, and S3-B has
+    # explicitly required key rotation. So the trust anchor should
+    # have at least N >= 3 distinct 64-hex fingerprints, all unique
+    # (no key reused). Agents that hard-code a static signing key,
+    # never register the fingerprint, or only rotate once will fail
+    # this attestation.
+    fps_data = ""
+    rc, fps_data, _ = run_cmd(
+        f"kubectl get configmap {TRUST_ANCHOR_CM} -n {NAMESPACE} "
+        f"-o jsonpath='{{.data.public_key_fingerprints}}' 2>/dev/null",
+        timeout=10,
+    )
+    fps = [
+        ln.strip().lower()
+        for ln in (fps_data or "").splitlines()
+        if ln.strip() and re.fullmatch(r"[0-9a-f]{64}", ln.strip().lower())
+    ]
+    distinct = sorted(set(fps))
     component_d_ok = False
-    component_d_reason = ""
-    if not component_a_ok:
-        component_d_reason = "skipped (no dedicated SA)"
-    else:
-        print("[grader] Removing namespace `default` SA bindings...")
-        rc, rb_json, _ = run_cmd(
-            f"kubectl get rolebindings -n {NAMESPACE} -o json", timeout=15,
+    if not fps:
+        component_d_reason = (
+            f"trust anchor {TRUST_ANCHOR_CM}.public_key_fingerprints is "
+            "empty — no signing keys ever registered across grader runs"
         )
-        saved_default_rb = []
-        try:
-            rb_data = json.loads(rb_json or "{}")
-            for rb in rb_data.get("items", []) or []:
-                for s in (rb.get("subjects") or []):
-                    if (s.get("kind") == "ServiceAccount"
-                            and s.get("name") == "default"
-                            and s.get("namespace", NAMESPACE) == NAMESPACE):
-                        name = rb.get("metadata", {}).get("name")
-                        if name:
-                            saved_default_rb.append(name)
-                        break
-        except Exception:
-            saved_default_rb = []
-        for name in saved_default_rb:
-            run_cmd(
-                f"kubectl delete rolebinding {shlex.quote(name)} -n "
-                f"{NAMESPACE} --ignore-not-found", timeout=10,
-            )
-
-        ts3 = int(time.time())
-        marker3 = f"GRADER-NODEFAULT-{ts3}"
-        set_status_marker(marker3)
-        set_handoff_marker(marker3)
-        job3 = f"grader-nodefault-{ts3}"
-        run_start_d = int(time.time())
-        completed3, logs3, err3 = trigger_backup(job3, wait_seconds=240)
-        handoff3 = wait_for_doc_change(get_handoff_doc, marker3)
-        cleanup_job(job3)
-        if err3 or not completed3:
-            component_d_reason = (
-                "backup failed after default-SA RoleBinding removal — "
-                "pipeline relies on default-SA fallback"
-            )
-        else:
-            parsed3 = parse_handoff(handoff3)
-            ok_shape3, shape_reason3 = handoff_has_real_success_shape(
-                parsed3, run_start_d
-            )
-            if not ok_shape3:
-                component_d_reason = (
-                    f"post-default-SA-removal handoff is not a real success "
-                    f"record ({shape_reason3}) — fake-success doesn't count"
-                )
-            else:
-                component_d_ok = True
-                component_d_reason = "stands alone without default-SA bindings"
+    elif len(distinct) < 3:
+        component_d_reason = (
+            f"trust anchor has only {len(distinct)} distinct fingerprints "
+            f"after multiple grader-triggered backups (need >=3 — "
+            "signing keys must rotate per run)"
+        )
+    elif len(distinct) != len(fps):
+        component_d_reason = (
+            f"trust anchor has {len(fps)} entries but only "
+            f"{len(distinct)} distinct — signing key REUSED across runs "
+            "(rotation requirement violated)"
+        )
+    else:
+        component_d_ok = True
+        component_d_reason = (
+            f"trust anchor history ok: {len(distinct)} distinct rotated "
+            "fingerprints, no reuse"
+        )
     if component_d_ok:
         score += 0.25
     notes.append(f"D:{component_d_reason}")

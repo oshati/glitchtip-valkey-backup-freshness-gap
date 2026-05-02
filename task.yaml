@@ -112,7 +112,15 @@ prompt: |
       resource. Exactly one of:
         {"type":"configmap","name":<cm-name>,"key":<data-key>}
         {"type":"secret","name":<secret-name>,"key":<data-key>}
-        {"type":"pvc","claim":<pvc-name>,"path":<absolute-path>}
+        {"type":"pvc","claim":<pvc-name>,"path":<pvc-root-relative-path>}
+      For the PVC variant, `path` is the absolute path of the artifact
+      file relative to the PVC root, NOT relative to whatever
+      mount-point the backup pod chose. Example: a backup that wrote
+      the file to `/archive/dump-XXX.rdb` from a pod that mounted the
+      claim at `/archive` must declare `path: "/dump-XXX.rdb"` —
+      because on the PVC itself, the file lives at the root, not in a
+      synthetic `archive/` subdirectory. Recovery tooling mounts the
+      PVC at its own location and resolves `path` from PVC root.
       A pre-provisioned archive PVC is available in the namespace for
       backups that prefer the durable PVC route; the namespace
       ResourceQuota does not budget additional PVCs for backup
