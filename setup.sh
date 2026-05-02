@@ -311,68 +311,13 @@ data:
   public_key_fingerprints: ""
 EOF
 
-# Content-shape admission policy on the runtime handoff ConfigMap.
-# Applied via a SEPARATE quoted heredoc so the regex backslashes
-# survive shell processing intact for CEL's string parser.
-kubectl apply -f - <<'POLICY_EOF'
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata:
-  name: glitchtip-handoff-shape
-  annotations:
-    contract.glitchtip.io/applies-to: "handoff CM in glitchtip namespace"
-    contract.glitchtip.io/purpose: "reject ill-formed handoff publishes"
-spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-    - apiGroups: [""]
-      apiVersions: ["v1"]
-      operations: ["CREATE","UPDATE"]
-      resources: ["configmaps"]
-  matchConditions:
-  - name: only-handoff-cm
-    expression: |
-      object.metadata.namespace == 'glitchtip' &&
-      object.metadata.name == 'glitchtip-valkey-backup-restore-handoff'
-  - name: has-handoff-key
-    expression: |
-      has(object.data) && 'handoff.json' in object.data
-  validations:
-  - expression: |
-      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*(true|false)')
-    message: "handoff.json must declare a boolean safe_for_restore"
-  - expression: |
-      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*false')
-      ||
-      (
-        object.data['handoff.json'].matches('"backup_id"\\s*:\\s*"[^"]+"')
-        && object.data['handoff.json'].matches('"snapshot_epoch"\\s*:\\s*[0-9]{10,}')
-        && object.data['handoff.json'].matches('"artifact_bytes"\\s*:\\s*[0-9]+')
-        && object.data['handoff.json'].matches('"artifact_sha256"\\s*:\\s*"[0-9a-f]{64}"')
-        && object.data['handoff.json'].matches('"artifact_location"\\s*:\\s*\\{')
-        && object.data['handoff.json'].matches('"artifact_source_pod"\\s*:\\s*"[^"]+"')
-        && object.data['handoff.json'].matches('"artifact_source_role"\\s*:\\s*"master"')
-        && object.data['handoff.json'].matches('"master_replid"\\s*:\\s*"[0-9a-f]{40}"')
-        && object.data['handoff.json'].matches('"master_repl_offset"\\s*:\\s*[0-9]+')
-        && object.data['handoff.json'].matches('"signature"\\s*:\\s*\\{')
-        && object.data['handoff.json'].matches('"alg"\\s*:\\s*"ed25519"')
-        && object.data['handoff.json'].matches('"public_key"\\s*:\\s*"[A-Za-z0-9+/=]+"')
-        && object.data['handoff.json'].matches('"sig"\\s*:\\s*"[A-Za-z0-9+/=]+"')
-        && object.data['handoff.json'].matches('"signed_at_epoch"\\s*:\\s*[0-9]{10,}')
-        && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{')
-        && object.data['handoff.json'].matches('"key_count_at_snapshot"\\s*:\\s*[0-9]+')
-      )
-    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id, snapshot_epoch, artifact_bytes, artifact_sha256, artifact_location object, artifact_source_pod, artifact_source_role:master, master_replid (40-hex), master_repl_offset, signature object {alg:ed25519, public_key, sig}, signed_at_epoch, restore_proof.key_count_at_snapshot"
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: glitchtip-handoff-shape-binding
-spec:
-  policyName: glitchtip-handoff-shape
-  validationActions: [Deny, Audit]
-POLICY_EOF
+# NOTE: the content-shape ValidatingAdmissionPolicy on the handoff
+# CM is installed at the END of setup (see "INSTALL HANDOFF
+# CONTENT-SHAPE ADMISSION POLICY" block near save-setup-info). It is
+# deferred so setup's own pre-populated stale handoff (which is
+# intentionally a fake-success record without attestation) can be
+# written first; the policy then applies from setup-completion
+# onward, intercepting only agent / saboteur writes.
 
 echo "[setup] Waiting for Valkey StatefulSet (2 replicas: 1 master + 1 read-only)..."
 # local-path-provisioner can take a moment after the heavy scale-down.
@@ -750,6 +695,74 @@ data:
       ]
     }
 EOF
+
+###############################################
+# INSTALL HANDOFF CONTENT-SHAPE ADMISSION POLICY
+# Deferred until AFTER the stale handoff is pre-populated, because
+# that pre-populated record is intentionally fake-success-shaped and
+# would be rejected by this very policy. The policy applies to
+# subsequent CREATE/UPDATE writes — i.e. to whatever the agent
+# pipeline (or the saboteur reconcilers) tries to publish.
+###############################################
+kubectl apply -f - <<'POLICY_EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: glitchtip-handoff-shape
+  annotations:
+    contract.glitchtip.io/applies-to: "handoff CM in glitchtip namespace"
+    contract.glitchtip.io/purpose: "reject ill-formed handoff publishes"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE","UPDATE"]
+      resources: ["configmaps"]
+  matchConditions:
+  - name: only-handoff-cm
+    expression: |
+      object.metadata.namespace == 'glitchtip' &&
+      object.metadata.name == 'glitchtip-valkey-backup-restore-handoff'
+  - name: has-handoff-key
+    expression: |
+      has(object.data) && 'handoff.json' in object.data
+  validations:
+  - expression: |
+      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*(true|false)')
+    message: "handoff.json must declare a boolean safe_for_restore"
+  - expression: |
+      object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*false')
+      ||
+      (
+        object.data['handoff.json'].matches('"backup_id"\\s*:\\s*"[^"]+"')
+        && object.data['handoff.json'].matches('"snapshot_epoch"\\s*:\\s*[0-9]{10,}')
+        && object.data['handoff.json'].matches('"artifact_bytes"\\s*:\\s*[0-9]+')
+        && object.data['handoff.json'].matches('"artifact_sha256"\\s*:\\s*"[0-9a-f]{64}"')
+        && object.data['handoff.json'].matches('"artifact_location"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"artifact_source_pod"\\s*:\\s*"[^"]+"')
+        && object.data['handoff.json'].matches('"artifact_source_role"\\s*:\\s*"master"')
+        && object.data['handoff.json'].matches('"master_replid"\\s*:\\s*"[0-9a-f]{40}"')
+        && object.data['handoff.json'].matches('"master_repl_offset"\\s*:\\s*[0-9]+')
+        && object.data['handoff.json'].matches('"signature"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"alg"\\s*:\\s*"ed25519"')
+        && object.data['handoff.json'].matches('"public_key"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        && object.data['handoff.json'].matches('"sig"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        && object.data['handoff.json'].matches('"signed_at_epoch"\\s*:\\s*[0-9]{10,}')
+        && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"key_count_at_snapshot"\\s*:\\s*[0-9]+')
+      )
+    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id, snapshot_epoch, artifact_bytes, artifact_sha256, artifact_location object, artifact_source_pod, artifact_source_role:master, master_replid (40-hex), master_repl_offset, signature object {alg:ed25519, public_key, sig}, signed_at_epoch, restore_proof.key_count_at_snapshot"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: glitchtip-handoff-shape-binding
+spec:
+  policyName: glitchtip-handoff-shape
+  validationActions: [Deny, Audit]
+POLICY_EOF
 
 ###############################################
 # SABOTEUR 1 — DRIFT RECONCILER CRONJOB
