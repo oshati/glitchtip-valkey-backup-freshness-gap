@@ -307,6 +307,8 @@ metadata:
     contract.glitchtip.io/canonical-payload-format: "json-sort-keys-true-separators-comma-colon-no-space"
     contract.glitchtip.io/canonical-payload-fields: "backup_id,snapshot_epoch,artifact_sha256,artifact_source_pod,artifact_source_role"
     contract.glitchtip.io/registration-protocol: "append-fingerprint-line-before-publish"
+    contract.glitchtip.io/artifact-location-types: "configmap | secret | pvc"
+    contract.glitchtip.io/artifact-location-shape: "object with type field plus per-type fields (cm/secret use name+key; pvc uses claim+path-from-pvc-root)"
 data:
   public_key_fingerprints: ""
 EOF
@@ -740,7 +742,7 @@ spec:
         && object.data['handoff.json'].matches('"snapshot_epoch"\\s*:\\s*[0-9]{10,}')
         && object.data['handoff.json'].matches('"artifact_bytes"\\s*:\\s*[0-9]+')
         && object.data['handoff.json'].matches('"artifact_sha256"\\s*:\\s*"[0-9a-f]{64}"')
-        && object.data['handoff.json'].matches('"artifact_location"\\s*:\\s*\\{')
+        && object.data['handoff.json'].matches('"artifact_location"\\s*:\\s*\\{[^}]*"type"\\s*:\\s*"(configmap|secret|pvc)"')
         && object.data['handoff.json'].matches('"artifact_source_pod"\\s*:\\s*"[^"]+"')
         && object.data['handoff.json'].matches('"artifact_source_role"\\s*:\\s*"master"')
         && object.data['handoff.json'].matches('"master_replid"\\s*:\\s*"[0-9a-f]{40}"')
@@ -753,7 +755,7 @@ spec:
         && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{')
         && object.data['handoff.json'].matches('"key_count_at_snapshot"\\s*:\\s*[0-9]+')
       )
-    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id, snapshot_epoch, artifact_bytes, artifact_sha256, artifact_location object, artifact_source_pod, artifact_source_role:master, master_replid (40-hex), master_repl_offset, signature object {alg:ed25519, public_key, sig}, signed_at_epoch, restore_proof.key_count_at_snapshot"
+    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id (string), snapshot_epoch (int 10+ digits), artifact_bytes (int), artifact_sha256 (64-hex), artifact_location object containing type:(configmap|secret|pvc), artifact_source_pod (string), artifact_source_role:master, master_replid (40-hex), master_repl_offset (int), signature object containing alg:ed25519 + public_key + sig (all base64), signed_at_epoch (int 10+ digits), restore_proof object containing key_count_at_snapshot (int)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
