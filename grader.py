@@ -1193,25 +1193,31 @@ def check_backup_enforces_snapshot_freshness(setup_info):
 def check_backup_artifact_durable_and_reusable(setup_info):
     """
     Binary subscore (1.0 or 0.0). Single coherent objective:
-        "The captured artifact is durably persisted AND can actually
-         be restored by recovery tooling."
+        "The persisted artifact is a TRUE point-in-time recovery
+         target — durably stored AND round-trips the freshness
+         contract to recovery time."
 
-    Four facets of the same objective — durability + restorability are
-    not separable, they are two halves of the same property:
+    Four facets — all aspects of "is the persisted artifact actually
+    usable as a recovery target?":
       A. The artifact_location declared in the handoff resolves to a
-         real, durable in-cluster resource (configmap/secret/pvc) —
-         proves the bytes are actually persisted somewhere.
+         real, durable in-cluster resource (configmap/secret/pvc).
       B. The retrieved bytes start with the REDIS magic and exceed a
-         minimum size — proves the persisted bytes are a real RDB,
-         not a placeholder.
+         minimum size — proves the bytes are a real RDB.
       C. The restore_proof key_count + artifact_bytes match the
-         retrieved bytes — proves the agent's claim about the
-         artifact lines up with what was actually persisted.
-      D. End-to-end restore probe: a clean Valkey pod loaded with the
-         retrieved bytes recovers the stable live keyset — proves the
-         persisted bytes are restorable, not just present.
-    Any failed facet => the durability+restorability objective is
-    not met => 0.0.
+         retrieved bytes — proves the handoff's claims line up with
+         what was actually persisted.
+      D. End-to-end restore probe: a clean Valkey loaded with the
+         persisted bytes (i) recovers the full stable live keyset
+         AND (ii) does NOT contain the post-BGSAVE-start key the
+         grader writes during the BGSAVE window. The second
+         condition distinguishes a true fork-frozen capture (point-
+         in-time recovery target — post-key absent) from a live
+         re-serialization at fetch time (post-key round-trips
+         through restore — NOT a recovery target). S1 tests
+         freshness at capture time; S2-D tests the same property
+         at restore time.
+    Any failed facet => the persisted artifact is not a point-in-
+    time recovery target => 0.0.
     """
     if not scale_valkey(2):
         return 0.0, "could not ensure Valkey is scaled to 2 replicas"
@@ -1226,10 +1232,51 @@ def check_backup_artifact_durable_and_reusable(setup_info):
     set_status_marker(marker)
     set_handoff_marker(marker)
 
+    # Spawn post-BGSAVE-start key writer (same pattern as S1-C) so the
+    # restore probe can verify the persisted artifact is a true
+    # point-in-time recovery target — the post-key must NOT round-trip
+    # through restore. A fork-frozen capture excludes it; a live
+    # re-serialization at fetch time captures it.
+    import threading as _thr
+    rdb_post_name = f"grader:post-bgsave:{ts}"
+    rdb_post_value = f"POST-ART-{ts}-NONCE-{os.urandom(8).hex()}"
+    post_written_flag = [False]
+    post_stop_flag = [False]
+    lastsave_before_art = get_lastsave()
+
+    def _post_key_thread_art():
+        deadline = time.time() + 90
+        while time.time() < deadline and not post_stop_flag[0]:
+            rc, info_out, _ = run_cmd(
+                f"kubectl exec -n {NAMESPACE} {VALKEY_POD} -- "
+                "valkey-cli INFO persistence 2>/dev/null", timeout=5,
+            )
+            in_progress = "rdb_bgsave_in_progress:1" in (info_out or "")
+            curr_last = 0
+            for ln in (info_out or "").splitlines():
+                if ln.startswith("rdb_last_save_time:"):
+                    try:
+                        curr_last = int(ln.split(":", 1)[1].strip())
+                    except ValueError:
+                        curr_last = 0
+                    break
+            if in_progress or curr_last > lastsave_before_art:
+                if write_marker_key(rdb_post_name, rdb_post_value):
+                    post_written_flag[0] = True
+                return
+            time.sleep(0.15)
+        if write_marker_key(rdb_post_name, rdb_post_value):
+            post_written_flag[0] = True
+
+    post_thread = _thr.Thread(target=_post_key_thread_art, daemon=True)
+    post_thread.start()
+
     job = f"grader-art-{ts}"
     completed, logs, err = trigger_backup(job, wait_seconds=240)
     handoff = wait_for_doc_change(get_handoff_doc, marker)
     cleanup_job(job)
+    post_stop_flag[0] = True
+    post_thread.join(timeout=5)
 
     score = 0.0
     notes = []
@@ -1389,32 +1436,52 @@ def check_backup_artifact_durable_and_reusable(setup_info):
                 "could not read live stable Valkey key set for comparison"
             )
         else:
+            # Probe with the live stable keys PLUS the post-BGSAVE-start
+            # key. If the persisted artifact is a true point-in-time
+            # recovery target (fork-frozen), the post-key was written to
+            # master AFTER the fork started, so it is NOT in the
+            # captured RDB and NOT recoverable from the artifact. If the
+            # artifact is a live re-serialization (e.g. sequential
+            # BGSAVE+--rdb), the post-key landed on master before the
+            # second fork and IS in the persisted bytes — round-trips
+            # through restore. We require the restored instance to
+            # contain every stable key AND to NOT contain the post-key.
+            probe_targets = set(live_keys)
+            probe_targets.add(rdb_post_name)
             matched, missing, probe_err = restore_probe_keyset(
-                artifact, live_keys
+                artifact, probe_targets
             )
             if probe_err and not matched:
                 component_d_reason = f"restore probe failed: {probe_err}"
             else:
-                # Filter probe-side keyset against the same predicate so
-                # any churn keys that happened to be in the RDB don't
-                # spuriously inflate the "matched" count.
-                matched = {k for k in matched if not _is_grader_or_traffic(k)}
-                missing = {k for k in missing if not _is_grader_or_traffic(k)}
-                # Strict: require 100% recovery on the stable keyset.
-                missed_count = len(live_keys) - len(matched)
+                post_key_in_restore = rdb_post_name in matched
+                # Filter the keyset comparison back to stable-only.
+                matched_stable = {k for k in matched if not _is_grader_or_traffic(k)}
+                missing_stable = {k for k in missing if not _is_grader_or_traffic(k)}
+                missed_count = len(live_keys) - len(matched_stable)
                 if missed_count > 0:
                     component_d_reason = (
                         f"restore probe recovered "
-                        f"{len(matched)}/{len(live_keys)} stable keys — "
+                        f"{len(matched_stable)}/{len(live_keys)} stable keys — "
                         f"need full match. missing sample: "
-                        f"{sorted(list(missing))[:5]}"
+                        f"{sorted(list(missing_stable))[:5]}"
+                    )
+                elif post_key_in_restore and post_written_flag[0]:
+                    component_d_reason = (
+                        f"persisted artifact is NOT a point-in-time recovery "
+                        f"target: post-BGSAVE-start key '{rdb_post_name}' "
+                        "round-tripped through restore (the captured bytes "
+                        "include a write that landed on master AFTER the "
+                        "snapshot started — i.e. live re-serialization, not "
+                        "fork-frozen)"
                     )
                 else:
                     component_d_ok = True
                     component_d_reason = (
                         f"restore probe matched "
-                        f"{len(matched)}/{len(live_keys)} stable "
-                        f"(missed={missed_count})"
+                        f"{len(matched_stable)}/{len(live_keys)} stable; "
+                        "post-BGSAVE-start key absent (point-in-time "
+                        "recovery target)"
                     )
     if component_d_ok:
         score += 0.25
