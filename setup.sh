@@ -81,8 +81,6 @@ kubectl label namespace glitchtip \
 kubectl annotate namespace glitchtip \
   "contract.glitchtip.io/backup-pod-security=restricted" \
   "contract.glitchtip.io/backup-pod-security-applies-to=workloads with label job=valkey-backup" \
-  "contract.glitchtip.io/backup-pod-security-required-fields=runAsNonRoot:true, allowPrivilegeEscalation:false, readOnlyRootFilesystem:true, capabilities.drop:[ALL], seccompProfile.type:(RuntimeDefault|Localhost)" \
-  "contract.glitchtip.io/backup-pod-security-applies-at=container-level securityContext on the backup container (pod-level inheritance accepted)" \
   --overwrite 2>/dev/null || true
 
 ###############################################
@@ -310,13 +308,7 @@ metadata:
     contract.glitchtip.io/canonical-payload-fields: "backup_id,snapshot_epoch,artifact_sha256,artifact_source_pod,artifact_source_role"
     contract.glitchtip.io/registration-protocol: "append-fingerprint-line-before-publish"
     contract.glitchtip.io/artifact-location-types: "configmap | secret | pvc"
-    contract.glitchtip.io/artifact-location-shape: "object with type field plus per-type fields"
-    contract.glitchtip.io/artifact-location-cm-fields: "type, name, key"
-    contract.glitchtip.io/artifact-location-secret-fields: "type, name, key"
-    contract.glitchtip.io/artifact-location-pvc-fields: "type, claim, path (PVC-root-relative)"
     contract.glitchtip.io/snapshot-consistency-requirement: "fork-frozen point-in-time"
-    contract.glitchtip.io/snapshot-consistency-test: "concurrent writes that land on master DURING the BGSAVE-to-fetch window must NOT appear in the captured artifact bytes"
-    contract.glitchtip.io/snapshot-consistency-failure-mode: "naive 'BGSAVE; wait LASTSAVE; --rdb' as separate steps re-forks at fetch and captures live state including post-BGSAVE writes"
 data:
   public_key_fingerprints: ""
 EOF
@@ -741,7 +733,7 @@ spec:
   validations:
   - expression: |
       object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*(true|false)')
-    message: "handoff.json must declare a boolean safe_for_restore"
+    message: "handoff publish rejected: shape contract violated."
   - expression: |
       object.data['handoff.json'].matches('"safe_for_restore"\\s*:\\s*false')
       ||
@@ -775,7 +767,7 @@ spec:
         && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{[^}]*"key_count_at_snapshot"\\s*:\\s*[1-9][0-9]*')
         && object.data['handoff.json'].matches('"restore_proof"\\s*:\\s*\\{[^}]*"lastsave_after"\\s*:\\s*[0-9]{10,}')
       )
-    message: "successful handoff (safe_for_restore:true) must carry the full attestation: backup_id (string), snapshot_epoch (int 10+ digits), artifact_bytes (int), artifact_sha256 (64-hex), artifact_location object EITHER {type:configmap|secret, name:..., key:...} OR {type:pvc, claim:..., path:...} (PVC path is PVC-root-relative, not container-mount-relative), artifact_source_pod (string), artifact_source_role:master, master_replid (40-hex), master_repl_offset (int), signature object containing alg:ed25519 + public_key + sig (all base64), signed_at_epoch (int 10+ digits), restore_proof object containing key_count_at_snapshot (positive int) AND lastsave_after (10+ digit unix epoch matching the LASTSAVE post-BGSAVE)"
+    message: "handoff publish rejected: success-shape contract violated. Recovery tooling reads a fixed schema; inspect the cluster's runtime artifacts to discover what fields the consumer expects."
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
